@@ -337,6 +337,15 @@ The default repository must resolve to an allowed repository. Invalid, ambiguous
 
 </details>
 
+<details>
+<summary><strong>MCP response budgets</strong></summary>
+
+The `query`, `context`, and `impact` tools accept an optional positive-integer `maxTokens` argument. It bounds the complete formatted MCP response, including hints and error text, using a deterministic four-UTF-8-bytes-per-token estimate. When truncation is required, the response ends with `…` and remains valid UTF-8.
+
+Set `GITNEXUS_MCP_DEFAULT_MAX_TOKENS` to apply the same guardrail when callers do not send `maxTokens`. An explicit tool argument takes precedence. Leaving both unset preserves the existing response byte-for-byte; this is a transport guardrail, not semantic pagination or an exact model-specific tokenizer limit.
+
+</details>
+
 ## CLI Reference
 
 Everyday commands:
@@ -486,6 +495,7 @@ Most `analyze` knobs are also CLI flags (`--workers`, `--worker-timeout`, `--max
 | `GITNEXUS_MCP_READ_ONLY`               | unset                     | Set to `1` to expose only proven single-repository read tools and resources; `0` disables the policy and any other value fails startup.      | The MCP server runs in an environment where graph mutation, raw Cypher, and cross-repository group routing must be unavailable.             |
 | `GITNEXUS_MCP_ALLOWED_REPOS`           | unset                     | Comma-separated allowlist of canonical indexed repository names or absolute paths. Invalid, ambiguous, or blank entries fail startup.       | One MCP process must expose only a bounded subset of the repositories in the global registry.                                               |
 | `GITNEXUS_MCP_DEFAULT_REPO`            | unset                     | Canonical indexed repository name or absolute path used when a tool or resource omits its repository. Must belong to the allowlist when one is set. | Several repositories are available but unqualified MCP calls should resolve deterministically.                                         |
+| `GITNEXUS_MCP_DEFAULT_MAX_TOKENS`      | unset                     | Default positive-integer response budget for MCP `query`, `context`, and `impact`, estimated at four UTF-8 bytes per token. Explicit `maxTokens` wins.      | Long MCP responses consume too much model context and callers cannot reliably add a per-request budget.                                    |
 
 </details>
 
