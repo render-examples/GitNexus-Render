@@ -1,5 +1,6 @@
 import { open } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { extname, isAbsolute, normalize, relative, resolve, sep } from 'node:path';
 
 const host = '0.0.0.0';
@@ -22,7 +23,10 @@ function jsonForScriptTag(obj) {
     .replace(/&/g, '\\u0026');
 }
 
-const rawBackendUrl = process.env.GITNEXUS_BACKEND_URL ?? null;
+// Falls back to RENDER_EXTERNAL_URL so a Render web service serves its own
+// public origin to the browser (same-origin API calls via the proxy below)
+// with no manual configuration.
+const rawBackendUrl = process.env.GITNEXUS_BACKEND_URL ?? process.env.RENDER_EXTERNAL_URL ?? null;
 if (rawBackendUrl && !isValidUrl(rawBackendUrl)) {
   const safeRaw = rawBackendUrl.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200);
   console.warn(
@@ -34,9 +38,90 @@ const configScript = backendUrl
   ? `<script>window.__GITNEXUS_CONFIG__=${jsonForScriptTag({ backendUrl })};</script>`
   : '';
 
+// Optional same-origin reverse proxy for the API server.
+//
+// On a split hosting setup (e.g. Render: this static web service is public,
+// the API server is a private/internal service) the browser must reach the
+// server WITHOUT a cross-origin request — the server's CORS allowlist and its
+// write-route origin guard only admit loopback/same-host origins. So instead
+// of exposing the server publicly and widening CORS, we point the browser at
+// THIS service's own origin (GITNEXUS_BACKEND_URL = our public URL) and
+// transparently forward every `/api/*` call to the internal server named by
+// GITNEXUS_UPSTREAM_URL. Unset → no proxy (the default docker-compose setup
+// where the browser talks to the server directly on the host).
+// Accept a scheme-less `host:port` (what Render's `fromService: hostport`
+// yields for an internal service) by defaulting to http://.
+const rawUpstreamUrl = process.env.GITNEXUS_UPSTREAM_URL
+  ? /^https?:\/\//.test(process.env.GITNEXUS_UPSTREAM_URL)
+    ? process.env.GITNEXUS_UPSTREAM_URL
+    : `http://${process.env.GITNEXUS_UPSTREAM_URL}`
+  : null;
+if (rawUpstreamUrl && !isValidUrl(rawUpstreamUrl)) {
+  const safeRaw = rawUpstreamUrl.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200);
+  console.warn(
+    `[gitnexus-web] GITNEXUS_UPSTREAM_URL "${safeRaw}" is not a valid http/https URL -- ignoring.`,
+  );
+}
+const upstreamBase = rawUpstreamUrl && isValidUrl(rawUpstreamUrl) ? rawUpstreamUrl : null;
+
+// Forward an `/api/*` request to the upstream API server, streaming the
+// request and response bodies (SSE / chunked graph streams) untouched.
+function proxyToUpstream(req, res) {
+  let upstream;
+  try {
+    upstream = new URL(req.url, upstreamBase);
+  } catch {
+    res.writeHead(400);
+    res.end('Bad request');
+    return;
+  }
+  const isHttps = upstream.protocol === 'https:';
+  const requestFn = isHttps ? httpsRequest : httpRequest;
+  const headers = { ...req.headers };
+  // Terminate the browser origin here: strip Origin/Referer so the API sees a
+  // trusted server-to-server call. Its CORS check (`isAllowedOrigin`) returns
+  // true for requests with no Origin, and its write-route guard falls through
+  // to `next()` when Origin is undefined. The browser only ever talks to this
+  // same-origin web service, so no cross-origin reach is lost.
+  delete headers.origin;
+  delete headers.referer;
+  headers.host = upstream.host;
+
+  const upstreamReq = requestFn(
+    {
+      protocol: upstream.protocol,
+      hostname: upstream.hostname,
+      port: upstream.port || (isHttps ? 443 : 80),
+      method: req.method,
+      path: upstream.pathname + upstream.search,
+      headers,
+    },
+    (upstreamRes) => {
+      // Forward status + headers verbatim; pipe the body so streaming
+      // responses (text/event-stream heartbeat, chunked graph stream) reach
+      // the browser incrementally instead of being buffered.
+      res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+      upstreamRes.on('error', () => res.destroy());
+      upstreamRes.pipe(res);
+    },
+  );
+  upstreamReq.on('error', (err) => {
+    console.error('[gitnexus-web] upstream proxy error:', err.message);
+    if (res.headersSent) {
+      res.destroy();
+    } else {
+      res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Bad gateway');
+    }
+  });
+  req.on('error', () => upstreamReq.destroy());
+  req.pipe(upstreamReq);
+}
+
 const contentTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
+  '.ico': 'image/x-icon',
   '.js': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.map': 'application/json; charset=utf-8',
@@ -67,6 +152,13 @@ const spaFallback = resolve(root, 'index.html');
 
 const server = createServer(async (req, res) => {
   const urlPath = req.url?.split('?')[0] || '/';
+
+  // Same-origin API proxy: forward `/api/*` to the upstream server when
+  // configured. Everything else is served as a static asset / SPA below.
+  if (upstreamBase && (urlPath === '/api' || urlPath.startsWith('/api/'))) {
+    proxyToUpstream(req, res);
+    return;
+  }
 
   let decoded;
   try {

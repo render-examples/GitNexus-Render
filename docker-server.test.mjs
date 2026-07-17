@@ -263,3 +263,199 @@ it('does not inject config into static assets', async () => {
     assert.equal(res.body, 'body{}');
   });
 });
+
+// -- API reverse proxy (GITNEXUS_UPSTREAM_URL) -----------------------------
+
+function rawRequest(port, path, { method = 'GET', headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
+      let respBody = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        respBody += chunk;
+      });
+      res.on('end', () =>
+        resolve({ status: res.statusCode, headers: res.headers, body: respBody }),
+      );
+    });
+    req.on('error', reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+// Spins up a fake upstream API server plus a docker-server pointed at it.
+// `upstream.handler` is mutable so each test can shape the upstream reply;
+// `upstream.received` captures the last forwarded request.
+async function withProxyServer(fn) {
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-'));
+  const distDir = join(dir, 'dist');
+  await mkdir(distDir, { recursive: true });
+  await writeFile(join(distDir, 'index.html'), '<html><body>spa</body></html>');
+
+  const upstream = {
+    received: null,
+    handler: (req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, path: req.url }));
+    },
+  };
+  const upstreamServer = createServer((req, res) => {
+    let reqBody = '';
+    req.setEncoding('utf8');
+    req.on('data', (c) => {
+      reqBody += c;
+    });
+    req.on('end', () => {
+      upstream.received = {
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        body: reqBody,
+      };
+      upstream.handler(req, res);
+    });
+  });
+  const upstreamPort = await new Promise((resolve) => {
+    upstreamServer.listen(0, '127.0.0.1', () => resolve(upstreamServer.address().port));
+  });
+
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${upstreamPort}`,
+    GITNEXUS_BACKEND_URL: `http://127.0.0.1:${port}`,
+  });
+  try {
+    await waitForServer(port);
+    await fn(port, upstream);
+  } finally {
+    await killAndWait(proc);
+    await new Promise((r) => upstreamServer.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+it('proxies /api/* requests to the upstream server', async () => {
+  await withProxyServer(async (port, upstream) => {
+    const res = await rawRequest(port, '/api/info?x=1');
+    assert.equal(res.status, 200);
+    assert.match(res.body, /"ok":true/);
+    assert.equal(upstream.received.url, '/api/info?x=1', 'path + query forwarded verbatim');
+  });
+});
+
+it('forwards the request method and body to the upstream', async () => {
+  await withProxyServer(async (port, upstream) => {
+    await rawRequest(port, '/api/query', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"q":"hello"}',
+    });
+    assert.equal(upstream.received.method, 'POST');
+    assert.equal(upstream.received.body, '{"q":"hello"}');
+  });
+});
+
+it('strips the browser Origin and Referer before forwarding to the API', async () => {
+  await withProxyServer(async (port, upstream) => {
+    await rawRequest(port, '/api/info', {
+      headers: { origin: 'https://gitnexus-web.onrender.com', referer: 'https://x/y' },
+    });
+    assert.equal(
+      upstream.received.headers.origin,
+      undefined,
+      'Origin must be stripped so the API treats it as a trusted server-to-server call',
+    );
+    assert.equal(upstream.received.headers.referer, undefined, 'Referer must be stripped');
+  });
+});
+
+it('does NOT proxy non-/api routes (still serves the SPA)', async () => {
+  await withProxyServer(async (port, upstream) => {
+    const res = await rawRequest(port, '/some/app/route');
+    assert.equal(res.status, 200);
+    assert.match(res.body, /spa/);
+    assert.equal(upstream.received, null, 'non-/api requests must not reach the upstream');
+  });
+});
+
+it('streams a chunked upstream response through to the client', async () => {
+  await withProxyServer(async (port, upstream) => {
+    upstream.handler = (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('data: one\n\n');
+      setTimeout(() => {
+        res.write('data: two\n\n');
+        res.end();
+      }, 20);
+    };
+    const res = await rawRequest(port, '/api/heartbeat');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['content-type'], 'text/event-stream');
+    assert.match(res.body, /data: one/);
+    assert.match(res.body, /data: two/);
+  });
+});
+
+it('accepts a scheme-less host:port upstream (Render fromService hostport)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-schemeless-'));
+  await mkdir(join(dir, 'dist'), { recursive: true });
+  await writeFile(join(dir, 'dist', 'index.html'), '<html><body>spa</body></html>');
+
+  let received = null;
+  const upstreamServer = createServer((req, res) => {
+    received = req.url;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await new Promise((resolve) => {
+    upstreamServer.listen(0, '127.0.0.1', () => resolve(upstreamServer.address().port));
+  });
+
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    // No http:// scheme — mimics `fromService: { property: hostport }`.
+    GITNEXUS_UPSTREAM_URL: `127.0.0.1:${upstreamPort}`,
+  });
+  try {
+    await waitForServer(port);
+    const res = await rawRequest(port, '/api/info');
+    assert.equal(res.status, 200);
+    assert.equal(received, '/api/info', 'scheme-less upstream should still be proxied');
+  } finally {
+    await killAndWait(proc);
+    await new Promise((r) => upstreamServer.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it('serves RENDER_EXTERNAL_URL as the backend origin when GITNEXUS_BACKEND_URL is unset', async () => {
+  await withInjectionServer(
+    { RENDER_EXTERNAL_URL: 'https://gitnexus-web.onrender.com' },
+    async (port) => {
+      const res = await rawGet(port, '/');
+      assert.equal(res.status, 200);
+      assert.ok(res.body.includes('window.__GITNEXUS_CONFIG__'));
+      assert.ok(res.body.includes('https://gitnexus-web.onrender.com'));
+    },
+  );
+});
+
+it('returns 502 when the upstream is unreachable', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-down-'));
+  await mkdir(join(dir, 'dist'), { recursive: true });
+  await writeFile(join(dir, 'dist', 'index.html'), '<html><body>spa</body></html>');
+  const deadPort = await getFreePort(); // nothing listening here
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${deadPort}`,
+  });
+  try {
+    await waitForServer(port);
+    const res = await rawRequest(port, '/api/info');
+    assert.equal(res.status, 502);
+  } finally {
+    await killAndWait(proc);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
