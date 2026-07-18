@@ -125,5 +125,11 @@ ENV GITNEXUS_HOME=/data/gitnexus \
 
 EXPOSE 4747
 
-# Bind to 0.0.0.0 so the server is reachable from the host's mapped port.
-CMD ["node", "gitnexus/dist/cli/index.js", "serve", "--host", "0.0.0.0", "--port", "4747"]
+# Bind to 0.0.0.0 so the server is reachable from the host's mapped port, and
+# honor an injected $PORT (Render sets it, e.g. 10000) with the baked-in default
+# as fallback. `exec` keeps the server as PID 1 so it receives SIGTERM for a
+# graceful shutdown; `sh -c` is required for ${PORT} expansion. `gitnexus` is the
+# PATH symlink created above. Because this is the image's own CMD (run directly,
+# not re-wrapped by a host shell), the single `sh -c` expands $PORT exactly once
+# — deployment platforms can drop any dockerCommand override and rely on this.
+CMD ["sh", "-c", "exec gitnexus serve --host 0.0.0.0 --port \"${PORT:-4747}\""]

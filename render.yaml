@@ -32,8 +32,10 @@ projects:
             plan: standard # repo indexing is memory-heavy; 512MB starter OOMs
             dockerfilePath: ./Dockerfile.cli
             dockerContext: .
-            # Bind Render's injected $PORT (the CLI reads --port, not $PORT).
-            dockerCommand: sh -c "node /app/gitnexus/dist/cli/index.js serve --host 0.0.0.0 --port $PORT"
+            # No dockerCommand override: the image's CMD already binds Render's
+            # injected $PORT (see Dockerfile.cli). A dockerCommand here is run
+            # through Render's own shell, so an `sh -c` wrapper would double-wrap
+            # into a single "command not found" token → exit 127.
             disk:
               name: gitnexus-data
               mountPath: /data/gitnexus
