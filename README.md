@@ -14,6 +14,31 @@ GitNexus parses a codebase into a graph of symbols and relationships and exposes
 
 This Blueprint deploys **two services** under one `gitnexus` Render project:
 
+```
+                        Render project: gitnexus
+   ┌───────────────────────────────────────────────────────────────┐
+   │                                                               │
+   │   ┌───────────────────┐         ┌───────────────────┐         │
+   │   │    gitnexus-web    │  /api/* │  gitnexus-server   │         │
+   │   │   PUBLIC (Docker)  │  proxy  │  PRIVATE (Docker)  │         │
+   │   │                    │ ──────▶ │                    │         │
+   │   │  • serves web UI   │ ◀────── │  • clones repos    │         │
+   │   │  • reverse-proxies │         │  • indexes graph   │         │
+   │   │    /api/* calls    │         │  • query / impact  │         │
+   │   └───────────────────┘         └─────────┬─────────┘         │
+   │             ▲                              │                    │
+   │             │                    ┌─────────▼──────────┐        │
+   └─────────────┼────────────────────┤  Persistent disk   ├────────┘
+                 │                     │  /data/gitnexus    │
+   same-origin   │                     │  index · repos ·   │
+   requests      │                     │     registry       │
+                 │                     └────────────────────┘
+            ┌────┴────┐
+            │ Browser │   Only gitnexus-web is reachable from the internet.
+            │ (user)  │   The server is internal-only, runs as a single
+            └─────────┘   instance, and keeps all state on the disk.
+```
+
 | Service | Type | Role |
 |---------|------|------|
 | `gitnexus-server` | **Private** service (Docker) | The code-intelligence API. Clones and indexes repos; keeps its index, cloned repos, and registry on a persistent disk (`/data/gitnexus`). Internal-only — never exposed to the public internet. |
