@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
+#
+# GitNexus on Render — one-click deploy Blueprint.
+#
+# Two services under a single "gitnexus" project:
+#   • gitnexus-server — the code-intelligence API. Deployed as a PRIVATE service
+#     (internal-only): it clones and indexes repositories, so it is never exposed
+#     to the public internet. State (indexes, cloned repos, registry) lives on a
+#     persistent disk, which pins it to a single instance.
+#   • gitnexus-web    — the public web UI. It serves the static app AND reverse-
+#     proxies every `/api/*` request to the private server (GITNEXUS_UPSTREAM_URL),
+#     so the browser only ever makes same-origin calls. No CORS configuration and
+#     no publicly reachable API server.
+#
+# No LLM key is stored anywhere: the core (index / graph / query / impact / wiki)
+# needs none. The optional in-app LLM chat is a client-side, bring-your-own-key
+# feature and is not part of this deploy.
+
+previews:
+  generation: off
+
+projects:
+  - name: gitnexus
+    environments:
+      - name: production
+        services:
+          # ── Private API server (internal only) ──────────────────────────
+          - type: pserv
+            name: gitnexus-server
+            runtime: docker
+            region: oregon
+            plan: standard # repo indexing is memory-heavy; 512MB starter OOMs
+            dockerfilePath: ./Dockerfile.cli
+            dockerContext: .
+            # Bind Render's injected $PORT (the CLI reads --port, not $PORT).
+            dockerCommand: sh -c "node /app/gitnexus/dist/cli/index.js serve --host 0.0.0.0 --port $PORT"
+            disk:
+              name: gitnexus-data
+              mountPath: /data/gitnexus
+              sizeGB: 10
+            envVars:
+              # Optional Azure DevOps Server integration. Leave unset to skip.
+              - key: AZURE_DEVOPS_URL
+                sync: false
+              - key: AZURE_DEVOPS_PAT
+                sync: false
+
+          # ── Public web UI + API reverse proxy ───────────────────────────
+          - type: web
+            name: gitnexus-web
+            runtime: docker
+            region: oregon
+            plan: starter
+            dockerfilePath: ./Dockerfile.web
+            dockerContext: .
+            healthCheckPath: /
+            envVars:
+              # Internal address of the private server; docker-server.mjs
+              # proxies /api/* here and prepends http:// to the host:port.
+              - key: GITNEXUS_UPSTREAM_URL
+                fromService:
+                  type: pserv
+                  name: gitnexus-server
+                  property: hostport
+              # GITNEXUS_BACKEND_URL is not set: docker-server.mjs falls back to
+              # RENDER_EXTERNAL_URL (this service's own public origin) so the
+              # browser makes same-origin /api calls that the proxy forwards.
