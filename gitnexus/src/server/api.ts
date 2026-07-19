@@ -32,6 +32,7 @@ import {
   closeLbug,
   withLbugDb,
   isReadOnlyDbError,
+  isQueryCompileError,
 } from '../core/lbug/lbug-adapter.js';
 import { isValidQueryParams } from '../core/lbug/query-params.js';
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
@@ -742,6 +743,15 @@ export const handleQueryRequest = async (
       res.status(403).json({ error: 'Write queries are not allowed via the HTTP API' });
       return;
     }
+    // A Cypher compile failure (malformed / non-Cypher input) is a client
+    // error, not a server fault — return 400 so it isn't reported as a 500.
+    if (isQueryCompileError(err)) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    // Genuine server-side failure: log it (the catch was previously silent,
+    // so 500s left no server-side trace) and return 500.
+    logger.error({ err }, '[api] /api/query failed');
     res.status(500).json({ error: err.message || 'Query failed' });
   }
 };

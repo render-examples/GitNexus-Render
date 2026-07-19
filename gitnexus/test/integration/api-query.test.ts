@@ -68,6 +68,22 @@ withTestLbugDB(
         expect(body.error).toContain('Write queries are not allowed');
       });
 
+      it('returns 400 (not 500) for a non-Cypher / malformed query', async () => {
+        // Regression: a natural-language question typed into the Cypher console
+        // is a client input error, not a server fault. It must surface as 400
+        // with the parser message — never a misleading 500.
+        const response = await fetch(`${baseUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            cypher: 'Which file in this repo is the most connected to other files?',
+          }),
+        });
+        expect(response.status).toBe(400);
+        const body = await response.json();
+        expect(body.error).toMatch(/Prepare failed|Parser exception/i);
+      });
+
       it('returns 400 for invalid params payload', async () => {
         const response = await fetch(`${baseUrl}/api/query`, {
           method: 'POST',
