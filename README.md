@@ -10,6 +10,13 @@ GitNexus parses a codebase into a graph of symbols and relationships and exposes
 
 > Full documentation, language support, and CLI usage live in the upstream project: **[abhigyanpatwari/GitNexus](https://github.com/abhigyanpatwari/GitNexus)**.
 
+## Prerequisites
+
+- A [Render account](https://render.com) — for the one-click deploy.
+- A [GitHub account](https://github.com) — only if you want to fork and customize this repo before deploying.
+- **No API keys required** for the core app. Two integrations are optional: an Azure DevOps Server URL + PAT (to index from Azure DevOps), and your own provider key for the in-app LLM chat (bring-your-own-key, stays in your browser). Both are covered below.
+- For **local development only**: [Docker](https://docs.docker.com/get-docker/) and Docker Compose.
+
 ## Architecture
 
 This Blueprint deploys **two services** under one `gitnexus` Render project:
