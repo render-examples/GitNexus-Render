@@ -271,6 +271,25 @@ export const isReadOnlyDbError = (err: unknown): boolean => {
   return false;
 };
 
+/**
+ * True when `err` is a query *compilation* failure surfaced by
+ * `executePrepared` — the DB rejected the Cypher at prepare time (parser /
+ * binder / catalog exception), which `executePrepared` wraps as
+ * `new Error('Prepare failed: <db message>')`. These are client input errors
+ * (malformed or invalid query text), not server faults, so HTTP callers should
+ * map them to 400 rather than 500. Walks the bounded `cause` chain like
+ * {@link isReadOnlyDbError} so a wrapped failure is still detected.
+ */
+export const isQueryCompileError = (err: unknown): boolean => {
+  let cur: unknown = err;
+  for (let depth = 0; depth < 5 && cur != null; depth++) {
+    const msg = cur instanceof Error ? cur.message : String(cur);
+    if (/^Prepare failed:/.test(msg)) return true;
+    cur = cur instanceof Error ? (cur as { cause?: unknown }).cause : undefined;
+  }
+  return false;
+};
+
 const isMissingFileError = (err: unknown): boolean => {
   const errno = err as NodeJS.ErrnoException;
   return errno?.code === 'ENOENT';
