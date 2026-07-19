@@ -247,7 +247,7 @@ export const Header = ({
                             />
                           </div>
                         </div>
-                        <div className="scrollbar-thin min-h-0 flex-1 overflow-y-auto pb-1">
+                        <div className="min-h-0 flex-1 scrollbar-thin overflow-y-auto pb-1">
                           {filteredRepos.length === 0 ? (
                             <div className="px-4 py-3 text-sm text-text-muted">
                               {t('header:noRepositoriesFound', { query: repoSearchQuery })}
@@ -530,7 +530,7 @@ export const Header = ({
       <div className="flex items-center gap-2">
         {/* GitHub Star Button */}
         <a
-          href="https://github.com/abhigyanpatwari/GitNexus"
+          href="https://github.com/Ho1yShif/GitNexus"
           target="_blank"
           rel="noopener noreferrer"
           className="group flex items-center gap-2 rounded-lg bg-gradient-to-r from-purple-600 to-pink-600 px-3.5 py-2 text-sm font-medium text-white shadow-lg transition-all duration-200 hover:-translate-y-0.5 hover:from-purple-500 hover:to-pink-500 hover:shadow-xl"

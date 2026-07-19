@@ -1,8 +1,4 @@
 {
-  "statusBar": {
-    "sponsor": "赞助",
-    "sponsorHint": "需要买点 API 额度跑 SWE-bench 😅"
-  },
   "loading": {
     "filesProgress": "{{processed}} / {{total}} 个文件"
   },
