@@ -214,10 +214,15 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
 
     case 'anthropic': {
       const anthropicConfig = config as AnthropicConfig;
+      // Do NOT send `temperature` to Anthropic: sampling params (temperature,
+      // top_p, top_k) were removed on Claude Sonnet 5 / Opus 4.7+ / Fable 5 and
+      // now return a 400 ("`temperature` is deprecated for this model."). Older
+      // Anthropic models tolerate its omission, so drop it unconditionally.
+      // (MiniMax below also uses ChatAnthropic but targets MiniMax's own
+      // endpoint, which still accepts temperature — leave it as-is.)
       return new ChatAnthropic({
         anthropicApiKey: anthropicConfig.apiKey,
         model: anthropicConfig.model,
-        temperature: anthropicConfig.temperature ?? 0.1,
         maxTokens: anthropicConfig.maxTokens ?? 8192,
         streaming: true,
       });

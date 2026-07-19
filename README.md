@@ -81,6 +81,10 @@ Once `gitnexus-web` is live, you can see it working with **no API key**:
 That's the full loop: index → graph → query → impact, entirely on the code graph.
 
 > **Optional LLM chat.** GitNexus also has an in-app chat that talks to an LLM. It is a **bring-your-own-key, client-side** feature: you paste your own provider key into the app's Settings, it is held only in your browser session, and it is sent only to the provider you choose — never to this server and never stored by the deploy. It is not required for anything above.
+>
+> **There is no backend env var for the chat.** Adding `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / etc. to the `gitnexus-server` (or `gitnexus-web`) service does **not** enable it — the browser calls the provider directly, so the key lives only in the app. To turn the chat on: open `gitnexus-web`, go to **Settings**, pick a provider, and paste your key. Supported providers: **OpenAI, Azure OpenAI, Google Gemini, Anthropic, OpenRouter, MiniMax, GLM (Z.AI), DeepSeek**, and **Ollama** (local, no key). Each key goes straight to that provider's API from your browser.
+>
+> (The only LLM-related backend env vars in this repo — `OPENAI_API_KEY`, `GITNEXUS_API_KEY`, `GITNEXUS_LLM_BASE_URL` — are used solely by the separate offline `gitnexus wiki` CLI generator, not by the chat or the deployed services.)
 
 ## Security notes
 

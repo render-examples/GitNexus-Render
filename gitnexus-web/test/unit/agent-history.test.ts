@@ -393,4 +393,28 @@ describe('createChatModel', () => {
       ),
     ).rejects.toThrow('DeepSeekChatOpenAICompletions does not support overlapping requests');
   });
+
+  it('does not send temperature for the Anthropic provider (deprecated on Claude 5 / Opus 4.7+)', () => {
+    const model = createChatModel({
+      provider: 'anthropic',
+      apiKey: 'test-key',
+      model: 'claude-sonnet-5',
+      temperature: 0.1,
+    } as any) as any;
+
+    // Sampling params were removed on newer Claude models and 400 if sent, so
+    // temperature must not be forwarded to the Anthropic request.
+    expect(model.temperature).toBeUndefined();
+  });
+
+  it('still sends temperature for the MiniMax provider (Anthropic-shaped, own endpoint)', () => {
+    const model = createChatModel({
+      provider: 'minimax',
+      apiKey: 'test-key',
+      model: 'MiniMax-M2.5',
+      temperature: 0.1,
+    } as any) as any;
+
+    expect(model.temperature).toBe(0.1);
+  });
 });
