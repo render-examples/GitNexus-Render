@@ -2,7 +2,7 @@
 
 Deploy [GitNexus](https://github.com/abhigyanpatwari/GitNexus) on Render in one click. Get a hosted **code-intelligence** service that indexes a repository into a knowledge graph, then lets you explore call graphs, run queries, and see the blast radius of a change — all from a browser.
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Ho1yShif/GitNexus)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/render-examples/GitNexus-Render)
 
 
 https://github.com/user-attachments/assets/10f89657-8c62-4d85-9d2d-e6f64d9c8744
