@@ -4,7 +4,9 @@ Deploy [GitNexus](https://github.com/abhigyanpatwari/GitNexus) on Render in one 
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Ho1yShif/GitNexus)
 
-https://github.com/user-attachments/assets/5597a2f2-6bfd-40f9-9247-718dbbab72bf
+
+https://github.com/user-attachments/assets/10f89657-8c62-4d85-9d2d-e6f64d9c8744
+
 
 ## What it does
 
