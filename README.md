@@ -30,20 +30,20 @@ This Blueprint deploys **two services** under one `gitnexus` Render project:
    ┌───────────────────────────────────────────────────────────────┐
    │                                                               │
    │   ┌───────────────────┐         ┌───────────────────┐         │
-   │   │    gitnexus-web    │  /api/* │  gitnexus-server   │         │
-   │   │   PUBLIC (Docker)  │  proxy  │  PRIVATE (Docker)  │         │
-   │   │                    │ ──────▶ │                    │         │
-   │   │  • serves web UI   │ ◀────── │  • clones repos    │         │
-   │   │  • reverse-proxies │         │  • indexes graph   │         │
-   │   │    /api/* calls    │         │  • query / impact  │         │
+   │   │   gitnexus-web    │  /api/* │  gitnexus-server  │         │
+   │   │   PUBLIC (Docker) │  proxy  │  PRIVATE (Docker) │         │
+   │   │                   │ ──────▶ │                   │         │
+   │   │  • serves web UI  │ ◀────── │  • clones repos   │         │
+   │   │  • reverse-proxies│         │  • indexes graph  │         │
+   │   │    /api/* calls   │         │  • query / impact │         │
    │   └───────────────────┘         └─────────┬─────────┘         │
-   │             ▲                              │                    │
-   │             │                    ┌─────────▼──────────┐        │
-   └─────────────┼────────────────────┤  Persistent disk   ├────────┘
-                 │                     │  /data/gitnexus    │
-   same-origin   │                     │  index · repos ·   │
-   requests      │                     │     registry       │
-                 │                     └────────────────────┘
+   │             ▲                             │                   │
+   │             │                    ┌────────▼───────────┐       │
+   └─────────────┼────────────────────┤  Persistent disk   ├───────┘
+                 │                    │  /data/gitnexus    │
+   same-origin   │                    │  index · repos ·   │
+   requests      │                    │     registry       │
+                 │                    └────────────────────┘
             ┌────┴────┐
             │ Browser │   Only gitnexus-web is reachable from the internet.
             │ (user)  │   The server is internal-only, runs as a single
