@@ -41,13 +41,16 @@ projects:
               mountPath: /data/gitnexus
               sizeGB: 10
             envVars:
-              # Demo mode. Visitors may still analyze their own repositories, but
-              # each added repo is private to the browser session that created it
-              # and is erased when that session ends; the pre-indexed "seed" repos
-              # stay browsable by everyone and are read-only (analyze/embed/delete
-              # against them → 403). The web UI learns this flag via GET /api/info.
+              # Demo mode. Off by default; set DEMO=true in the dashboard to
+              # enable (marked sync: false so it is dashboard-managed and never
+              # forced by a Blueprint sync). When on, visitors may still analyze
+              # their own repositories, but each added repo is private to the
+              # browser session that created it and is erased when that session
+              # ends; the pre-indexed "seed" repos stay browsable by everyone and
+              # are read-only (analyze/embed/delete against them → 403). The web
+              # UI learns this flag via GET /api/info.
               - key: DEMO
-                value: 'false'
+                sync: false
               # Optional Azure DevOps Server integration. Leave unset to skip.
               - key: AZURE_DEVOPS_URL
                 sync: false

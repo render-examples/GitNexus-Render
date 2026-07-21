@@ -92,7 +92,7 @@ That's the full loop: index → graph → query → impact, entirely on the code
 
 ## Demo mode
 
-For public, shareable deployments, set `DEMO=true` on **`gitnexus-server` only**. The web UI picks it up automatically via `GET /api/info` — no env var on `gitnexus-web`. In demo mode visitors can still index their own repositories, but each added repo is private to the browser session that created it and is erased when that session ends; the pre-indexed "seed" repos stay browsable by everyone and are read-only. Leave `DEMO` unset for a normal single-tenant deploy.
+Demo mode is **off by default**. For public, shareable deployments, enable it by setting `DEMO=true` in the Render dashboard on **`gitnexus-server` only** (`render.yaml` marks it `sync: false`, so it's dashboard-managed and a Blueprint sync never overrides it). The web UI picks it up automatically via `GET /api/info` — no env var on `gitnexus-web`. In demo mode visitors can still index their own repositories, but each added repo is private to the browser session that created it and is erased when that session ends; the pre-indexed "seed" repos stay browsable by everyone and are read-only. Leave `DEMO` unset for a normal single-tenant deploy.
 
 ## Security notes
 
