@@ -22,7 +22,9 @@
 
 import fsp from 'fs/promises';
 import path from 'path';
+import { randomBytes } from 'crypto';
 import { canonicalizePath, getGlobalDir } from '../storage/repo-manager.js';
+import { retryRename } from '../storage/fs-atomic.js';
 import { logger } from '../core/logger.js';
 
 export interface DemoOwner {
@@ -68,7 +70,18 @@ export class DemoStore {
     for (const [k, v] of this.owners) obj[k] = v;
     try {
       await fsp.mkdir(path.dirname(this.file), { recursive: true });
-      await fsp.writeFile(this.file, JSON.stringify(obj), 'utf8');
+      // Atomic tmp-file + rename (matches repo-manager's writeMetaFile). This
+      // file exists only for crash recovery, so a torn write from a mid-write
+      // crash must be impossible: loadOrphans would parse-fail on it, treat it
+      // as empty, and leak the very orphaned repos it is meant to reclaim.
+      const tmpPath = `${this.file}.tmp.${randomBytes(8).toString('hex')}`;
+      const handle = await fsp.open(tmpPath, 'wx', 0o600);
+      try {
+        await handle.writeFile(JSON.stringify(obj), 'utf8');
+      } finally {
+        await handle.close();
+      }
+      await retryRename(tmpPath, this.file);
     } catch (err) {
       logger.warn({ err }, '[demo] failed to persist demo owners');
     }

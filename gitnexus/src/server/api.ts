@@ -35,7 +35,12 @@ import {
   isQueryCompileError,
 } from '../core/lbug/lbug-adapter.js';
 import { isValidQueryParams } from '../core/lbug/query-params.js';
-import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
+import {
+  NODE_TABLES,
+  isValidDemoSessionId,
+  type GraphNode,
+  type GraphRelationship,
+} from 'gitnexus-shared';
 import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
 import { ftsDegradedWarning } from '../core/search/fts-indexes.js';
@@ -866,16 +871,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   // Session identity for demo mode. The web app generates a stable id in
   // localStorage and sends it on every request; we validate it to a safe charset
-  // (it keys the ownership map and is never used as a path). Non-browser callers
-  // (curl/CLI) omit it and simply get no session-scoped repos. The client mirrors
-  // this pattern in demo-session.ts.
-  const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+  // (it keys the ownership map and is never used as a path) via the shared
+  // `isValidDemoSessionId` the client also uses. Non-browser callers (curl/CLI)
+  // omit it and simply get no session-scoped repos.
   const getSessionId = (req: express.Request): string | undefined => {
     const raw = req.headers['x-gitnexus-session'];
-    if (typeof raw !== 'string') return undefined;
-    return SESSION_ID_PATTERN.test(raw) ? raw : undefined;
+    return isValidDemoSessionId(raw) ? raw : undefined;
   };
-  if (demo && demoStore) {
+  if (demoStore) {
     app.use((req, _res, next) => {
       const sessionId = getSessionId(req);
       if (sessionId) demoStore.touch(sessionId);
@@ -1045,7 +1048,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   const DEMO_SESSION_IDLE_MS = 30 * 60 * 1000; // 30 minutes of silence ⇒ session over
   const DEMO_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
   let demoSweepTimer: ReturnType<typeof setInterval> | undefined;
-  if (demo && demoStore) {
+  if (demoStore) {
     void (async () => {
       try {
         const orphanPaths = await demoStore.loadOrphans();
@@ -1201,11 +1204,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   app.get('/api/repos', async (req, res) => {
     try {
       const repos = await listRegisteredRepos();
-      const sessionId = demo && demoStore ? getSessionId(req) : undefined;
-      const visible =
-        demo && demoStore
-          ? repos.filter((r) => demoStore.isSeed(r.path) || demoStore.ownedBy(r.path, sessionId))
-          : repos;
+      const sessionId = demoStore ? getSessionId(req) : undefined;
+      const visible = demoStore
+        ? repos.filter((r) => demoStore.isSeed(r.path) || demoStore.ownedBy(r.path, sessionId))
+        : repos;
       res.json(
         visible.map((r) => ({
           name: r.name,
@@ -1214,7 +1216,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           indexedAt: r.indexedAt,
           lastCommit: r.lastCommit,
           stats: r.stats,
-          ...(demo && demoStore ? { demoOwned: demoStore.ownedBy(r.path, sessionId) } : {}),
+          ...(demoStore ? { demoOwned: demoStore.ownedBy(r.path, sessionId) } : {}),
         })),
       );
     } catch (err: any) {
@@ -1227,13 +1229,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // visitor's repos disappear as soon as they leave; the idle sweep is the
   // backstop for beacons that never arrive. No-op (and unregistered) outside
   // demo mode. Always 200 — a best-effort beacon has nothing to act on.
-  if (demo && demoStore) {
+  if (demoStore) {
     app.post('/api/demo/end-session', createRouteLimiter(), async (req, res) => {
       // Accept the session id from the header OR a `?session=` query param:
       // navigator.sendBeacon (fired on tab close) cannot set custom headers.
       const rawQuery = req.query.session;
-      const querySession =
-        typeof rawQuery === 'string' && SESSION_ID_PATTERN.test(rawQuery) ? rawQuery : undefined;
+      const querySession = isValidDemoSessionId(rawQuery) ? rawQuery : undefined;
       const sessionId = getSessionId(req) ?? querySession;
       if (sessionId) {
         try {
@@ -1296,7 +1297,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       // Demo mode: a visitor may only delete a repo their own session added.
       // Seed repos and other sessions' repos are protected.
-      if (demo && demoStore && !demoStore.ownedBy(entry.path, getSessionId(req))) {
+      if (demoStore && !demoStore.ownedBy(entry.path, getSessionId(req))) {
         res.status(403).json({
           error: 'GitNexus demo mode: you can only remove repositories you added in this session.',
         });
@@ -1313,7 +1314,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       try {
         await eraseRepo(entry);
-        if (demo && demoStore) await demoStore.release([entry.path]);
+        if (demoStore) await demoStore.release([entry.path]);
         res.json({ deleted: entry.name });
       } finally {
         releaseRepoLock(lockKey);
@@ -1800,7 +1801,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         // from being clobbered. `demoTargetPath` is the directory the worker will
         // analyze, reused as the ownership key so the claim matches the registry.
         let demoTargetPath: string | undefined;
-        if (demo && demoStore) {
+        if (demoStore) {
           demoTargetPath = repoLocalPath;
           if (!demoTargetPath && repoUrl) {
             try {
@@ -1974,7 +1975,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         // Demo mode: embeddings may only be generated for a repo the caller's
         // session added; seed repos and others' repos are protected.
-        if (demo && demoStore && !demoStore.ownedBy(entry.path, getSessionId(req))) {
+        if (demoStore && !demoStore.ownedBy(entry.path, getSessionId(req))) {
           res.status(403).json({
             error:
               'GitNexus demo mode: embeddings can only be generated for repositories you added.',

@@ -28,6 +28,9 @@ export type { MroStrategy } from './mro-strategy.js';
 // Pipeline progress
 export type { PipelinePhase, PipelineProgress } from './pipeline.js';
 
+// Demo-mode session identity (shared by server + web so the charset can't drift)
+export { DEMO_SESSION_ID_PATTERN, isValidDemoSessionId } from './demo.js';
+
 // ─── Scope-based resolution — RFC #909 (Ring 1 #910) ────────────────────────
 // Data model (RFC §2)
 export type { ParameterTypeClass, SymbolDefinition } from './scope-resolution/symbol-definition.js';

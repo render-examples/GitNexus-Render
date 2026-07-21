@@ -6,11 +6,12 @@
  * The web app supplies that identity: a stable random id kept in localStorage and
  * sent on every request via the `X-GitNexus-Session` header. It is meaningful
  * only in demo mode; outside demo mode the server ignores it. The id is opaque
- * (never a path or secret) and constrained to a safe charset the server validates.
+ * (never a path or secret) and constrained to a safe charset the server validates
+ * via the same shared `isValidDemoSessionId`.
  */
+import { isValidDemoSessionId } from 'gitnexus-shared';
 
 const STORAGE_KEY = 'gitnexus-demo-session';
-const VALID = /^[A-Za-z0-9_-]{1,64}$/;
 
 let cached: string | null = null;
 
@@ -32,7 +33,7 @@ export const getDemoSessionId = (): string => {
   if (cached) return cached;
   try {
     const existing = localStorage.getItem(STORAGE_KEY);
-    if (existing && VALID.test(existing)) {
+    if (isValidDemoSessionId(existing)) {
       cached = existing;
       return existing;
     }
