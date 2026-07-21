@@ -476,6 +476,18 @@ export const fetchServerInfo = async (): Promise<ServerInfo> => {
 };
 
 /**
+ * Learn demo mode from the server and hand it to `setDemo`. Best-effort: a
+ * stale/older server without the field, or any fetch failure, degrades to
+ * non-demo (the setter is left untouched). Shared by the auto-connect and
+ * DropZone entry paths so both scope mutation controls identically.
+ */
+export const syncDemoMode = (setDemo: (demo: boolean) => void): void => {
+  fetchServerInfo()
+    .then((info) => setDemo(Boolean(info.demo)))
+    .catch(() => {});
+};
+
+/**
  * Ask the demo server to erase every repo this browser session added. Fired on
  * tab close/hide via navigator.sendBeacon, which cannot set headers — so the
  * session id travels as a query param. Best-effort and non-blocking; the server

@@ -867,11 +867,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // Session identity for demo mode. The web app generates a stable id in
   // localStorage and sends it on every request; we validate it to a safe charset
   // (it keys the ownership map and is never used as a path). Non-browser callers
-  // (curl/CLI) omit it and simply get no session-scoped repos.
+  // (curl/CLI) omit it and simply get no session-scoped repos. The client mirrors
+  // this pattern in demo-session.ts.
+  const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
   const getSessionId = (req: express.Request): string | undefined => {
     const raw = req.headers['x-gitnexus-session'];
     if (typeof raw !== 'string') return undefined;
-    return /^[A-Za-z0-9_-]{1,64}$/.test(raw) ? raw : undefined;
+    return SESSION_ID_PATTERN.test(raw) ? raw : undefined;
   };
   if (demo && demoStore) {
     app.use((req, _res, next) => {
@@ -974,10 +976,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // is owned before the worker registers it, so it never surfaces as an unowned
   // "seed" repo to other sessions during the analyze/finalize window. A claim on
   // a path whose analysis later fails is harmless: no registry entry ever
-  // matches it, and session cleanup simply drops the stale ownership.
-  const claimDemoRepo = (targetPath: string | undefined, sessionId: string | undefined): void => {
+  // matches it, and session cleanup simply drops the stale ownership. Awaited by
+  // callers before the worker launches so ownership is durably persisted first —
+  // a crash in the gap would otherwise leave the repo unowned (a visible seed).
+  const claimDemoRepo = async (
+    targetPath: string | undefined,
+    sessionId: string | undefined,
+  ): Promise<void> => {
     if (!demoStore || !targetPath || !sessionId) return;
-    void demoStore.claim(targetPath, sessionId);
+    await demoStore.claim(targetPath, sessionId);
   };
 
   // Erase every repo owned by a demo session, then forget the session. Skips a
@@ -1002,7 +1009,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         continue;
       }
       const lockKey = getStoragePath(entry.path);
-      if (acquireRepoLock(lockKey)) {
+      // Non-null return means analyze/embed holds the lock — skip; the idle
+      // sweep retries. (Same acquireRepoLock contract as the DELETE route.)
+      if (acquireRepoLock(lockKey) !== null) {
         skipped++;
         continue;
       }
@@ -1224,9 +1233,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       // navigator.sendBeacon (fired on tab close) cannot set custom headers.
       const rawQuery = req.query.session;
       const querySession =
-        typeof rawQuery === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(rawQuery)
-          ? rawQuery
-          : undefined;
+        typeof rawQuery === 'string' && SESSION_ID_PATTERN.test(rawQuery) ? rawQuery : undefined;
       const sessionId = getSessionId(req) ?? querySession;
       if (sessionId) {
         try {
@@ -1834,7 +1841,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         // Demo mode: claim the repo for this session now (before the worker
         // registers it) so it is visible only to this visitor and erased with
         // them, never surfacing as a seed repo mid-analysis.
-        claimDemoRepo(demoTargetPath, getSessionId(req));
+        await claimDemoRepo(demoTargetPath, getSessionId(req));
 
         // Mark as active synchronously to prevent race with concurrent requests
         jobManager.updateJob(job.id, { status: 'cloning' });
@@ -1905,9 +1912,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       failJob: (jobId, error) => jobManager.updateJob(jobId, { status: 'failed', error }),
       // Demo mode: an uploaded repo always lands in a fresh dir, so there is no
       // seed-repo to protect here — just claim it for the uploading session.
-      onJobCreated: (targetPath, req) => {
-        claimDemoRepo(targetPath, getSessionId(req));
-      },
+      onJobCreated: (targetPath, req) => claimDemoRepo(targetPath, getSessionId(req)),
     }),
   );
 

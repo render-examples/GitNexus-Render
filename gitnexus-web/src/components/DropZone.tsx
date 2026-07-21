@@ -3,7 +3,7 @@ import { Loader2, Check, Sparkles } from '@/lib/lucide-icons';
 import {
   connectToServer,
   fetchRepos,
-  fetchServerInfo,
+  syncDemoMode,
   type ConnectResult,
   type BackendRepo,
 } from '../services/backend-client';
@@ -183,9 +183,7 @@ export const DropZone = ({ onServerConnect }: DropZoneProps) => {
       // session-private and scope mutation controls. A stale/older server
       // without the field degrades to non-demo (falsy). Demo mode still lets
       // visitors analyze their own repos, so the phase logic is unchanged.
-      fetchServerInfo()
-        .then((info) => setDemo(Boolean(info.demo)))
-        .catch(() => {});
+      syncDemoMode(setDemo);
 
       if (repos.length === 0) {
         setPhase('analyze');

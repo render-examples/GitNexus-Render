@@ -38,9 +38,11 @@ export interface AnalyzeUploadDeps {
    * Called once the analysis job has been created (and the single analysis slot
    * taken), before the worker launches. `targetPath` is the directory that will
    * be analyzed and registered. Lets the server associate the repo with the
-   * requesting session in demo mode. Best-effort — must not throw.
+   * requesting session in demo mode. Best-effort — must not throw. Awaited so a
+   * durable side effect (e.g. persisting session ownership) completes before the
+   * worker launches.
    */
-  onJobCreated?: (targetPath: string, req: Request) => void;
+  onJobCreated?: (targetPath: string, req: Request) => void | Promise<void>;
   /** Injectable for tests (defaults to the real ingestUpload). */
   ingest?: typeof ingestUpload;
 }
@@ -120,7 +122,7 @@ export function createAnalyzeUploadHandler(deps: AnalyzeUploadDeps) {
         throw err;
       }
       createdJobId = job.id;
-      deps.onJobCreated?.(finalDir, req);
+      await deps.onJobCreated?.(finalDir, req);
 
       // Promote staging → persistent upload dir. Both live under UPLOAD_ROOT's
       // filesystem, so this rename stays atomic (no EXDEV).

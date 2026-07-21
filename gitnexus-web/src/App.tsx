@@ -14,7 +14,7 @@ import { buildGraphFromConnectResult } from './lib/apply-connect-result';
 import {
   connectToServer,
   fetchRepos,
-  fetchServerInfo,
+  syncDemoMode,
   endDemoSession,
   normalizeServerUrl,
   connectHeartbeat,
@@ -214,9 +214,7 @@ const AppContent = () => {
         // Learn demo mode so the header scopes mutation controls to session-owned
         // repos even when arriving via a bookmarked ?server/?repo URL (bypasses
         // DropZone), and so the end-session cleanup beacon is armed.
-        fetchServerInfo()
-          .then((info) => setDemo(Boolean(info.demo)))
-          .catch(() => {});
+        syncDemoMode(setDemo);
       })
       .catch((err) => {
         console.error('Auto-connect failed:', err);
