@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { computeWorkerHeapCapMb } from '../../src/server/analyze-launch.js';
+import { computeWorkerHeapCapMb, resolveWorkerHeapCapMb } from '../../src/server/analyze-launch.js';
 
 // Mirrors the `computeHeapCapMb` tests in analyze-heap-respawn.test.ts, but for
 // the server worker's container-aware ceiling. The key difference is the small
@@ -42,5 +42,24 @@ describe('computeWorkerHeapCapMb (container-aware worker heap cap)', () => {
   it('uses physical RAM when the cgroup cap is not smaller', () => {
     // cap >= physical -> treated as unconstrained; 8GB -> floor(0.75 * 8192) = 6144
     expect(computeWorkerHeapCapMb(8 * GB, 8 * GB)).toBe(6144);
+  });
+});
+
+describe('resolveWorkerHeapCapMb (GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB override)', () => {
+  const GB = 1024 * 1024 * 1024;
+
+  it('uses a valid positive-integer override verbatim, ignoring the auto-size', () => {
+    // Override wins even though the auto-size of a 4GB box would be 3072.
+    expect(resolveWorkerHeapCapMb('2048', 4 * GB, null)).toBe(2048);
+  });
+
+  it('falls back to the auto-size when the override is unset', () => {
+    expect(resolveWorkerHeapCapMb(undefined, 4 * GB, null)).toBe(3072);
+  });
+
+  it('falls back to the auto-size when the override is invalid (non-numeric, zero, negative)', () => {
+    expect(resolveWorkerHeapCapMb('not-a-number', 4 * GB, null)).toBe(3072);
+    expect(resolveWorkerHeapCapMb('0', 4 * GB, null)).toBe(3072);
+    expect(resolveWorkerHeapCapMb('-512', 4 * GB, null)).toBe(3072);
   });
 });

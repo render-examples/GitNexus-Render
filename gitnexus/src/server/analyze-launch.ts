@@ -23,6 +23,8 @@ import {
   listRegisteredRepos,
   registryPathEquals,
 } from '../storage/repo-manager.js';
+import { heapCapMb, readConstrainedBytes } from '../core/memory.js';
+import { parsePositiveIntEnv } from '../core/ingestion/utils/env.js';
 import { logger } from '../core/logger.js';
 import type { JobManager } from './analyze-job.js';
 import type { WorkerMessage } from './analyze-worker.js';
@@ -58,16 +60,9 @@ const MAX_WORKER_RETRIES = 2;
 const WORKER_HEAP_FLOOR_MB = 1024;
 
 /**
- * Container-aware old-space heap ceiling (MB) for the forked analyze worker:
- * `0.75 × effective RAM`, clamped to `>= WORKER_HEAP_FLOOR_MB`. Mirrors
- * `computeHeapCapMb` in `cli/analyze.ts` (kept local rather than imported to
- * avoid a server→cli dependency, and because the server wants the small floor
- * above, not the CLI's 16 GB one).
- *
- * `constrainedBytes` is the cgroup limit or `null`; it is honored ONLY when it
- * is a real, smaller-than-physical cap, because `process.constrainedMemory()`
- * returns a huge sentinel when UNCONSTRAINED — trusting it unconditionally would
- * produce a ceiling far above physical RAM.
+ * Container-aware old-space heap ceiling (MB) for the forked analyze worker.
+ * Thin wrapper over the shared {@link heapCapMb} that pins the small
+ * {@link WORKER_HEAP_FLOOR_MB} (vs the CLI's 16 GB floor).
  *
  * The ceiling MUST stay BELOW the container's real memory limit. A ceiling above
  * available RAM (the old hardcoded `8192` on a 2 GB instance) makes the cgroup
@@ -82,35 +77,29 @@ export function computeWorkerHeapCapMb(
   totalBytes: number,
   constrainedBytes: number | null,
 ): number {
-  const effectiveBytes =
-    constrainedBytes !== null && constrainedBytes > 0 && constrainedBytes < totalBytes
-      ? constrainedBytes
-      : totalBytes;
-  const effectiveMb = Math.floor(effectiveBytes / (1024 * 1024));
-  return Math.max(WORKER_HEAP_FLOOR_MB, Math.floor(0.75 * effectiveMb));
-}
-
-function readConstrainedBytes(): number | null {
-  if (typeof process.constrainedMemory !== 'function') return null;
-  const c = process.constrainedMemory();
-  return typeof c === 'number' && c > 0 ? c : null;
-}
-
-function positiveInteger(value: unknown): number | undefined {
-  const parsed = typeof value === 'string' ? Number(value) : value;
-  return typeof parsed === 'number' && Number.isFinite(parsed) && parsed > 0
-    ? Math.floor(parsed)
-    : undefined;
+  return heapCapMb(totalBytes, constrainedBytes, WORKER_HEAP_FLOOR_MB);
 }
 
 /**
- * Old-space heap ceiling (MB) passed to the forked analyze worker. An explicit
- * operator override (GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB) wins; otherwise it
- * is sized to the container (see {@link computeWorkerHeapCapMb}).
+ * Resolve the worker heap ceiling (MB): an explicit, valid positive-integer
+ * operator override (`GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB`) wins; an unset
+ * or invalid value falls back to the container-aware auto-size
+ * ({@link computeWorkerHeapCapMb}). Pure (env value passed in) so the override
+ * precedence is unit-testable.
  */
-const WORKER_MAX_OLD_SPACE_MB =
-  positiveInteger(process.env.GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB) ??
-  computeWorkerHeapCapMb(os.totalmem(), readConstrainedBytes());
+export function resolveWorkerHeapCapMb(
+  overrideRaw: string | undefined,
+  totalBytes: number,
+  constrainedBytes: number | null,
+): number {
+  return parsePositiveIntEnv(overrideRaw) ?? computeWorkerHeapCapMb(totalBytes, constrainedBytes);
+}
+
+const WORKER_MAX_OLD_SPACE_MB = resolveWorkerHeapCapMb(
+  process.env.GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB,
+  os.totalmem(),
+  readConstrainedBytes(),
+);
 
 /**
  * The worker reports `complete` over IPC before its on-disk finalization

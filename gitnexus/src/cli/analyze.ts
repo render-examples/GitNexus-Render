@@ -13,6 +13,7 @@ import os from 'os';
 import { spawn } from 'child_process';
 import v8 from 'v8';
 import cliProgress from 'cli-progress';
+import { heapCapMb, readConstrainedBytes } from '../core/memory.js';
 import { isLbugReady, LbugWipeError } from '../core/lbug/lbug-adapter.js';
 import { boundedCheckpointBeforeExit } from '../core/lbug/shutdown-helpers.js';
 import {
@@ -134,23 +135,11 @@ const DEFAULT_HEAP_MB = 16384;
  * RAM-aware re-exec heap cap (MB): `0.75 × effective RAM`, clamped to
  * `>= DEFAULT_HEAP_MB`. Kept BELOW physical RAM on purpose — a cap `>=` RAM makes
  * V8 collect lazily and inflate the heap into swap-thrash (observed analyzing the
- * Linux kernel at a 30GB cap on a 31GB box). `constrainedBytes` is the cgroup
- * limit or `null`; it is honored only as a real, smaller-than-physical cap, because
- * `process.constrainedMemory()` returns a huge sentinel when UNCONSTRAINED.
+ * Linux kernel at a 30GB cap on a 31GB box). Thin wrapper over the shared
+ * {@link heapCapMb} that pins the CLI's large `DEFAULT_HEAP_MB` floor.
  */
 export function computeHeapCapMb(totalBytes: number, constrainedBytes: number | null): number {
-  const effectiveBytes =
-    constrainedBytes !== null && constrainedBytes > 0 && constrainedBytes < totalBytes
-      ? constrainedBytes
-      : totalBytes;
-  const effectiveMb = Math.floor(effectiveBytes / (1024 * 1024));
-  return Math.max(DEFAULT_HEAP_MB, Math.floor(0.75 * effectiveMb));
-}
-
-function readConstrainedBytes(): number | null {
-  if (typeof process.constrainedMemory !== 'function') return null;
-  const c = process.constrainedMemory();
-  return typeof c === 'number' && c > 0 ? c : null;
+  return heapCapMb(totalBytes, constrainedBytes, DEFAULT_HEAP_MB);
 }
 
 const HEAP_MB = computeHeapCapMb(os.totalmem(), readConstrainedBytes());
