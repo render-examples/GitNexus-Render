@@ -587,6 +587,39 @@ it('retries a connection-refused POST and succeeds once the upstream is up', asy
   });
 });
 
+it('does NOT retry after the client aborts during the backoff window', async () => {
+  // Upstream is down at first and binds at ~400ms. The first attempt hits
+  // ECONNREFUSED and schedules a retry; the client aborts (~100ms) before the
+  // upstream comes up. The backoff guard must cancel the pending retry, so the
+  // upstream — which binds mid-backoff — is never contacted. Without the guard,
+  // a later retry (~500ms) would land after the bind and run the job for a
+  // request nobody is waiting on.
+  await withFlakyUpstream(1, {}, async (port, state) => {
+    await new Promise((resolve) => {
+      const req = http.request({
+        host: '127.0.0.1',
+        port,
+        path: '/api/analyze',
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': '12' },
+      });
+      req.on('error', () => {}); // aborting surfaces a local socket error; ignore
+      req.write('{"repo":"x"}');
+      req.end();
+      // Abort after the first attempt has failed-and-scheduled (ECONNREFUSED is
+      // near-instant) but well before the upstream binds at ~400ms.
+      setTimeout(() => {
+        req.destroy();
+        resolve();
+      }, 100);
+    });
+    // Wait past the upstream bind + full retry budget (~750ms) so a leaked retry
+    // would already have landed.
+    await new Promise((r) => setTimeout(r, 900));
+    assert.equal(state.served, 0, 'aborted request must not be retried against the upstream');
+  });
+});
+
 it('returns 502 after exhausting the retry budget when the upstream stays down', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-retry-down-'));
   await mkdir(join(dir, 'dist'), { recursive: true });
@@ -792,6 +825,9 @@ it('returns 400 when the client declares a body but never finishes sending it', 
 
   // Raw socket (not http.request, which would auto-finish the body): send a
   // Content-Length: 100 request but only 10 bytes, then hold the socket open.
+  // We never close our side — the proxy must close it for us once the body read
+  // times out (via `Connection: close`), rather than holding the half-open
+  // connection until the server requestTimeout reaps it.
   const rawStalledPost = () =>
     new Promise((resolve, reject) => {
       const sock = connect(port, '127.0.0.1', () => {
@@ -805,23 +841,43 @@ it('returns 400 when the client declares a body but never finishes sending it', 
         );
       });
       let buf = '';
+      let status = null;
+      // Fail-safe: if the proxy never closes on its own, report serverClosed
+      // false (so the assertion fails cleanly) instead of hanging the test.
+      const guard = setTimeout(() => {
+        sock.destroy();
+        resolve({ status, serverClosed: false, raw: buf });
+      }, 2000);
       sock.setEncoding('utf8');
       sock.on('data', (chunk) => {
         buf += chunk;
-        const statusLine = buf.split('\r\n', 1)[0];
-        const m = statusLine.match(/^HTTP\/\d\.\d (\d{3})/);
-        if (m) {
-          sock.destroy();
-          resolve(Number(m[1]));
+        if (status === null) {
+          const m = buf.split('\r\n', 1)[0].match(/^HTTP\/\d\.\d (\d{3})/);
+          if (m) status = Number(m[1]);
         }
       });
-      sock.on('error', reject);
+      // The server closing its side (Connection: close) ends our socket; treat
+      // any teardown initiated by the server as "closed promptly".
+      sock.on('error', () => {}); // a reset may precede 'close'; swallow it
+      sock.on('close', () => {
+        clearTimeout(guard);
+        resolve({ status, serverClosed: true, raw: buf });
+      });
     });
 
   try {
     await waitForServer(port);
-    const status = await rawStalledPost();
+    const { status, serverClosed, raw } = await rawStalledPost();
     assert.equal(status, 400, 'stalled body read must be bounded and return 400, not hang');
+    assert.ok(
+      serverClosed,
+      'proxy must close the half-open connection promptly, not hold it until requestTimeout',
+    );
+    assert.match(
+      raw.toLowerCase(),
+      /connection: close/,
+      'the 400 for a stalled body must advertise Connection: close',
+    );
     assert.equal(served, 0, 'proxy must not connect upstream when the body never arrives');
   } finally {
     await killAndWait(proc);

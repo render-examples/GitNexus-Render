@@ -216,17 +216,27 @@ async function proxyToUpstream(req, res) {
   const isIdempotentMethod = idempotentMethods.has(method);
   const hasBody = method !== 'GET' && method !== 'HEAD';
   const len = Number(req.headers['content-length']);
-  const small =
+  const bufferable =
     proxyRetryEnabled && Number.isFinite(len) && len >= 0 && len <= proxyRetryMaxBodyBytes;
   let bodyBuf = hasBody ? null : Buffer.alloc(0);
-  if (hasBody && small) {
+  if (hasBody && bufferable) {
     bodyBuf = await readBodyCapped(req, proxyRetryMaxBodyBytes, proxyClientBodyTimeoutMs);
     if (bodyBuf === null) {
       // Overflowed the cap, the client errored mid-read, or the read timed out.
       // Kept as a single 400 (not split into 408/413) — the overflow->400
       // behavior was not flagged, so preserve it deliberately.
+      //
+      // The client may still be mid-upload (a slow/stalled body is exactly the
+      // timeout case), so send `Connection: close`: Node closes the socket once
+      // the 400 has flushed instead of keeping it half-open to drain the rest of
+      // the body until the server requestTimeout reaps it (~300s). Letting Node
+      // close after the flush avoids the truncation race of destroying the
+      // shared req/res socket by hand.
       if (!res.headersSent) {
-        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.writeHead(400, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          Connection: 'close',
+        });
         res.end('Bad request');
       }
       return;
@@ -270,7 +280,12 @@ async function proxyToUpstream(req, res) {
         console.warn(
           `[gitnexus-web] upstream ${err.code}; retry ${n}/${proxyRetryAttempts - 1} in ${delay}ms`,
         );
-        setTimeout(() => attempt(n + 1), delay);
+        setTimeout(() => {
+          // The client may have aborted during the backoff window; don't fire a
+          // fresh upstream request nobody is waiting for anymore.
+          if (res.writableEnded || res.destroyed) return;
+          attempt(n + 1);
+        }, delay);
         return;
       }
       console.error('[gitnexus-web] upstream proxy error:', err.message);
