@@ -90,6 +90,10 @@ That's the full loop: index → graph → query → impact, entirely on the code
 >
 > (The only LLM-related backend env vars in this repo — `OPENAI_API_KEY`, `GITNEXUS_API_KEY`, `GITNEXUS_LLM_BASE_URL` — are used solely by the separate offline `gitnexus wiki` CLI generator, not by the chat or the deployed services.)
 
+## Demo mode
+
+For public, shareable deployments, set `DEMO=true` on **`gitnexus-server` only**. The web UI picks it up automatically via `GET /api/info` — no env var on `gitnexus-web`. In demo mode visitors can still index their own repositories, but each added repo is private to the browser session that created it and is erased when that session ends; the pre-indexed "seed" repos stay browsable by everyone and are read-only. Leave `DEMO` unset for a normal single-tenant deploy.
+
 ## Security notes
 
 - The API server is a **private** Render service, so the repo-indexing endpoints are not reachable from the public internet — only the web service (which proxies same-origin) can reach it.
