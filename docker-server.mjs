@@ -173,6 +173,18 @@ function readBodyCapped(req, cap, timeoutMs) {
   });
 }
 
+// Fail a proxied request with a gateway error. Once response headers are sent
+// the body is already partially written and can't be replaced, so we can only
+// destroy the socket; otherwise emit a clean status + plain-text body.
+function failGateway(res, status, message) {
+  if (res.headersSent) {
+    res.destroy();
+  } else {
+    res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(message);
+  }
+}
+
 // Hop-by-hop headers (RFC 7230 §6.1) are connection-specific and must not be
 // forwarded by a proxy. Node's http client sets its own Connection/
 // Transfer-Encoding for the upstream hop, so passing the browser's through
@@ -303,23 +315,13 @@ async function proxyToUpstream(req, res) {
         return;
       }
       console.error('[gitnexus-web] upstream proxy error:', err.message);
-      if (res.headersSent) {
-        res.destroy();
-      } else {
-        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('Bad gateway');
-      }
+      failGateway(res, 502, 'Bad gateway');
     });
     if (proxyTimeoutMs > 0) {
       upstreamReq.setTimeout(proxyTimeoutMs, () => {
         timedOut = true;
         console.error(`[gitnexus-web] upstream proxy timeout after ${proxyTimeoutMs}ms`);
-        if (res.headersSent) {
-          res.destroy();
-        } else {
-          res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
-          res.end('Gateway timeout');
-        }
+        failGateway(res, 504, 'Gateway timeout');
         upstreamReq.destroy();
       });
     }
@@ -379,12 +381,7 @@ const server = createServer(async (req, res) => {
     // Mirror the 502 / res.destroy() shape used inside its own error handler.
     proxyToUpstream(req, res).catch((err) => {
       console.error('[gitnexus-web] proxy handler crashed:', err?.message ?? err);
-      if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('Bad gateway');
-      } else {
-        res.destroy();
-      }
+      failGateway(res, 502, 'Bad gateway');
     });
     return;
   }
