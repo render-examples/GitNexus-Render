@@ -11,6 +11,7 @@
  */
 
 import path from 'path';
+import os from 'node:os';
 import { existsSync, statSync } from 'node:fs';
 import { fork } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -49,6 +50,67 @@ export interface LaunchOptions {
 }
 
 const MAX_WORKER_RETRIES = 2;
+
+/** Floor for the auto-sized worker heap cap — the sizer never goes below this,
+ *  so a tiny or misreported memory limit still leaves the worker a workable
+ *  heap. Unlike the CLI's DEFAULT_HEAP_MB (16384), this is a small container
+ *  floor: the server is meant to run in a memory-limited instance. */
+const WORKER_HEAP_FLOOR_MB = 1024;
+
+/**
+ * Container-aware old-space heap ceiling (MB) for the forked analyze worker:
+ * `0.75 × effective RAM`, clamped to `>= WORKER_HEAP_FLOOR_MB`. Mirrors
+ * `computeHeapCapMb` in `cli/analyze.ts` (kept local rather than imported to
+ * avoid a server→cli dependency, and because the server wants the small floor
+ * above, not the CLI's 16 GB one).
+ *
+ * `constrainedBytes` is the cgroup limit or `null`; it is honored ONLY when it
+ * is a real, smaller-than-physical cap, because `process.constrainedMemory()`
+ * returns a huge sentinel when UNCONSTRAINED — trusting it unconditionally would
+ * produce a ceiling far above physical RAM.
+ *
+ * The ceiling MUST stay BELOW the container's real memory limit. A ceiling above
+ * available RAM (the old hardcoded `8192` on a 2 GB instance) makes the cgroup
+ * OOM-killer fire on a large repo BEFORE V8 reaches its own recoverable
+ * "JavaScript heap out of memory" — killing the parent server (PID 1) and the
+ * whole service, instead of just this worker. Sized to the container it stays
+ * contained: V8 aborts the child, `child.on('exit')` retries up to
+ * MAX_WORKER_RETRIES, and an exhausted job fails cleanly while the server (and
+ * every other job) stays up.
+ */
+export function computeWorkerHeapCapMb(
+  totalBytes: number,
+  constrainedBytes: number | null,
+): number {
+  const effectiveBytes =
+    constrainedBytes !== null && constrainedBytes > 0 && constrainedBytes < totalBytes
+      ? constrainedBytes
+      : totalBytes;
+  const effectiveMb = Math.floor(effectiveBytes / (1024 * 1024));
+  return Math.max(WORKER_HEAP_FLOOR_MB, Math.floor(0.75 * effectiveMb));
+}
+
+function readConstrainedBytes(): number | null {
+  if (typeof process.constrainedMemory !== 'function') return null;
+  const c = process.constrainedMemory();
+  return typeof c === 'number' && c > 0 ? c : null;
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  const parsed = typeof value === 'string' ? Number(value) : value;
+  return typeof parsed === 'number' && Number.isFinite(parsed) && parsed > 0
+    ? Math.floor(parsed)
+    : undefined;
+}
+
+/**
+ * Old-space heap ceiling (MB) passed to the forked analyze worker. An explicit
+ * operator override (GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB) wins; otherwise it
+ * is sized to the container (see {@link computeWorkerHeapCapMb}).
+ */
+const WORKER_MAX_OLD_SPACE_MB =
+  positiveInteger(process.env.GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB) ??
+  computeWorkerHeapCapMb(os.totalmem(), readConstrainedBytes());
 
 /**
  * The worker reports `complete` over IPC before its on-disk finalization
@@ -156,7 +218,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') return;
 
       const child = fork(workerPath, [], {
-        execArgv: [...tsxHookArgs, '--max-old-space-size=8192'],
+        execArgv: [...tsxHookArgs, `--max-old-space-size=${WORKER_MAX_OLD_SPACE_MB}`],
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
 

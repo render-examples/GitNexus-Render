@@ -84,6 +84,15 @@ Once `gitnexus-web` is live, you can see it working with **no API key**:
 
 That's the full loop: index → graph → query → impact, entirely on the code graph.
 
+### Large repositories
+
+Indexing is memory-intensive — it is the peak-RAM step of the whole app. The default `gitnexus-server` runs on a **2 GB (`standard`)** instance, which comfortably handles small and mid-sized repos. A very large repo can need more memory than that to finish.
+
+When a repo exceeds the available memory, the indexing worker aborts and the **job fails cleanly with an out-of-memory error** — the server (and every other in-flight job) stays up. If you hit that, you have two knobs:
+
+- **Give the indexer more RAM (recommended for large repos).** In [`render.yaml`](render.yaml), raise the `gitnexus-server` `plan` (e.g. `pro` → 4 GB, `pro plus` → 8 GB) and redeploy. This is the real fix for a repo that genuinely needs more memory.
+- **Tune the worker heap ceiling (advanced).** `GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB` on `gitnexus-server` overrides the per-worker V8 old-space heap cap (MB). It defaults to ~75% of the instance's memory. Leave it unset unless you have a specific reason — setting it **above** the instance's real RAM re-introduces the kernel OOM-kill that this default is designed to avoid.
+
 > **Optional LLM chat.** GitNexus also has an in-app chat that talks to an LLM. It is a **bring-your-own-key, client-side** feature: you paste your own provider key into the app's Settings, it is held only in your browser session, and it is sent only to the provider you choose — never to this server and never stored by the deploy. It is not required for anything above.
 >
 > **There is no backend env var for the chat.** Adding `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / etc. to the `gitnexus-server` (or `gitnexus-web`) service does **not** enable it — the browser calls the provider directly, so the key lives only in the app. To turn the chat on: open `gitnexus-web`, go to **Settings**, pick a provider, and paste your key. Supported providers: **OpenAI, Azure OpenAI, Google Gemini, Anthropic, OpenRouter, MiniMax, GLM (Z.AI), DeepSeek**, and **Ollama** (local, no key). Each key goes straight to that provider's API from your browser.

@@ -29,7 +29,13 @@ projects:
             name: gitnexus-server
             runtime: docker
             region: oregon
-            plan: standard # repo indexing is memory-heavy; 512MB starter OOMs
+            # repo indexing is memory-heavy; 512MB starter OOMs. `standard`
+            # (2GB) handles small/mid repos. A large repo may need more RAM to
+            # finish — bump to `pro` (4GB) / `pro plus` (8GB) here and redeploy.
+            # An over-memory repo now fails the JOB cleanly (the worker's heap
+            # ceiling is sized to this instance, so V8 aborts the child and the
+            # server survives) instead of OOM-killing the whole service.
+            plan: standard
             dockerfilePath: ./Dockerfile.cli
             dockerContext: .
             # No dockerCommand override: the image's CMD already binds Render's
@@ -55,6 +61,13 @@ projects:
               - key: AZURE_DEVOPS_URL
                 sync: false
               - key: AZURE_DEVOPS_PAT
+                sync: false
+              # Advanced: override the analyze worker's V8 old-space heap cap
+              # (MB). Unset → ~75% of this instance's RAM (keeps a large-repo
+              # OOM contained to the worker). Only set this if you know why;
+              # a value ABOVE the instance's real RAM re-enables the OOM-kill
+              # of the whole service. See README § Large repositories.
+              - key: GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB
                 sync: false
 
           # ── Public web UI + API reverse proxy ───────────────────────────
