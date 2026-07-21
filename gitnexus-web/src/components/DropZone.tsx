@@ -3,10 +3,12 @@ import { Loader2, Check, Sparkles } from '@/lib/lucide-icons';
 import {
   connectToServer,
   fetchRepos,
+  syncDemoMode,
   type ConnectResult,
   type BackendRepo,
 } from '../services/backend-client';
 import { useBackend } from '../hooks/useBackend';
+import { useAppState } from '../hooks/useAppState';
 import { OnboardingGuide } from './OnboardingGuide';
 import { AnalyzeOnboarding } from './AnalyzeOnboarding';
 import { RepoLanding } from './RepoLanding';
@@ -140,7 +142,8 @@ function LoadingCard({ message }: { message: string }) {
 // ── DropZone ─────────────────────────────────────────────────────────────────
 
 export const DropZone = ({ onServerConnect }: DropZoneProps) => {
-  const { t } = useTranslation(['common', 'errors']);
+  const { t } = useTranslation(['common', 'errors', 'onboarding']);
+  const { setDemo } = useAppState();
   const [error, setError] = useState<string | null>(null);
 
   // Backend polling for server detection
@@ -175,6 +178,13 @@ export const DropZone = ({ onServerConnect }: DropZoneProps) => {
 
     try {
       const repos = await fetchRepos();
+
+      // Learn demo mode from the server so the UI can label added repos as
+      // session-private and scope mutation controls. A stale/older server
+      // without the field degrades to non-demo (falsy). Demo mode still lets
+      // visitors analyze their own repos, so the phase logic is unchanged.
+      syncDemoMode(setDemo);
+
       if (repos.length === 0) {
         setPhase('analyze');
         autoConnectRan.current = false;

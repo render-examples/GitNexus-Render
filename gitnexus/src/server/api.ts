@@ -30,12 +30,18 @@ import {
   streamQuery,
   flushWAL,
   closeLbug,
+  closeLbugIfOpen,
   withLbugDb,
   isReadOnlyDbError,
   isQueryCompileError,
 } from '../core/lbug/lbug-adapter.js';
 import { isValidQueryParams } from '../core/lbug/query-params.js';
-import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
+import {
+  NODE_TABLES,
+  isValidDemoSessionId,
+  type GraphNode,
+  type GraphRelationship,
+} from 'gitnexus-shared';
 import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
 import { ftsDegradedWarning } from '../core/search/fts-indexes.js';
@@ -53,10 +59,12 @@ import {
 } from './git-clone.js';
 import { createAnalyzeUploadHandler } from './analyze-upload.js';
 import { createLocalhostOriginGuard, normalizeBoundHost } from './middleware.js';
+import { DemoStore } from './demo-store.js';
 import { createLaunchAnalysisWorker } from './analyze-launch.js';
 import { UPLOAD_ROOT } from './upload-paths.js';
 import { sweepStaleUploads } from './upload-sweep.js';
 import { isRfc1918PrivateIpv4 } from './private-ip.js';
+import { parseTruthyEnv } from '../core/ingestion/utils/env.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
 
 const _require = createRequire(import.meta.url);
@@ -847,6 +855,38 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // server's own bound host — scoped to prevent CSRF from other LAN devices.
   const requireLocalhostOrigin = createLocalhostOriginGuard(host);
 
+  // Demo mode. When DEMO is truthy, visitors may still analyze/upload their own
+  // repositories to explore them, but each added repo is private to the browser
+  // session that created it and is erased when that session ends. The pre-indexed
+  // "seed" repos (those already registered when the server booted, or added by an
+  // operator) stay browsable by everyone but cannot be mutated by visitors. See
+  // demo-store.ts. Read routes are untouched.
+  const demo = parseTruthyEnv(process.env.DEMO);
+  const demoStore = demo ? new DemoStore() : null;
+  if (demo) {
+    logger.info(
+      '[gitnexus serve] Demo mode enabled (DEMO): visitor repositories are private to their ' +
+        'session and erased when the session ends; seed repositories are read-only.',
+    );
+  }
+
+  // Session identity for demo mode. The web app generates a stable id in
+  // localStorage and sends it on every request; we validate it to a safe charset
+  // (it keys the ownership map and is never used as a path) via the shared
+  // `isValidDemoSessionId` the client also uses. Non-browser callers (curl/CLI)
+  // omit it and simply get no session-scoped repos.
+  const getSessionId = (req: express.Request): string | undefined => {
+    const raw = req.headers['x-gitnexus-session'];
+    return isValidDemoSessionId(raw) ? raw : undefined;
+  };
+  if (demoStore) {
+    app.use((req, _res, next) => {
+      const sessionId = getSessionId(req);
+      if (sessionId) demoStore.touch(sessionId);
+      next();
+    });
+  }
+
   // A wildcard bind (`0.0.0.0`/`::`) has no single host identity for the
   // same-host check, so browser write routes accept only loopback origins.
   // Warn the operator so a remote-access deployment isn't silently write-blocked.
@@ -890,6 +930,127 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     activeRepoPaths.delete(repoPath);
   };
 
+  // Tear down a repository: its .gitnexus index/storage, its clone or upload
+  // directory, and its registry entry — then reload the backend. Shared by the
+  // DELETE /api/repo route and the demo-mode cleanup paths. Assumes the caller
+  // holds the repo lock (or that no analyze/embed is in flight). Never throws on
+  // missing files; a delete of already-gone data is a no-op.
+  const eraseRepo = async (entry: RegistryEntry): Promise<void> => {
+    // Release the shared query handle only if it currently has THIS repo open.
+    // That handle is a switch-on-demand cache for the direct query routes, so a
+    // repo that isn't the open one holds no handle here and its files rm cleanly
+    // without a close. Closing unconditionally would abort an unrelated in-flight
+    // query on another repo — a real hazard under demo mode's concurrent visitors
+    // plus the idle sweep, which erases one session's repo while others browse
+    // seed repos. (`backend.init()` below still refreshes the pool + registry for
+    // every erase; only the global-handle close is now scoped.)
+    try {
+      await closeLbugIfOpen(path.join(entry.storagePath, 'lbug'));
+    } catch {}
+    // 1. Index/storage dir.
+    await fs.rm(getStoragePath(entry.path), { recursive: true, force: true }).catch(() => {});
+    // 2. Clone dir, only when it is this entry's own checkout.
+    let cloneDir: string | null = null;
+    try {
+      cloneDir = getCloneDir(entry.name);
+    } catch {
+      /* local repo: no eligible clone dir */
+    }
+    if (cloneDir && cloneDirBelongsToEntry(cloneDir, entry.path)) {
+      try {
+        if ((await fs.stat(cloneDir)).isDirectory()) {
+          await fs.rm(cloneDir, { recursive: true, force: true });
+        }
+      } catch {
+        /* clone dir may not exist */
+      }
+    }
+    // 3. Uploaded repo dir (when entry.path lives under UPLOAD_ROOT).
+    const resolvedEntry = path.resolve(entry.path);
+    if (resolvedEntry === UPLOAD_ROOT || resolvedEntry.startsWith(UPLOAD_ROOT + path.sep)) {
+      await fs.rm(resolvedEntry, { recursive: true, force: true }).catch(() => {});
+    }
+    // 4. Registry entry, then reload.
+    const { unregisterRepo } = await import('../storage/repo-manager.js');
+    await unregisterRepo(entry.path);
+    await backend.init().catch(() => {});
+  };
+
+  // Find a registered entry whose canonical path matches `repoPath`.
+  const findEntryByPath = (repos: RegistryEntry[], repoPath: string): RegistryEntry | undefined => {
+    const target = canonicalizePath(path.resolve(repoPath));
+    return repos.find((r) => registryPathEquals(canonicalizePath(path.resolve(r.path)), target));
+  };
+
+  // Resolve the local clone directory a git URL will be analyzed (and
+  // registered) in. Both the demo-mode ownership claim — which MUST key on the
+  // exact path the worker registers, or the repo surfaces as an unowned seed
+  // repo — and the worker's own clone step derive the path through this one
+  // function, so the two can never drift.
+  const cloneTargetForUrl = (repoUrl: string): { repoName: string; cloneDir: string } => {
+    const repoName = extractRepoName(repoUrl);
+    return { repoName, cloneDir: getCloneDir(repoName) };
+  };
+
+  // In demo mode, claim a repo for a session at the moment its analysis starts,
+  // keyed by the directory the worker will analyze (which the registry keys the
+  // entry by). Claiming eagerly — rather than on job completion — means the repo
+  // is owned before the worker registers it, so it never surfaces as an unowned
+  // "seed" repo to other sessions during the analyze/finalize window. A claim on
+  // a path whose analysis later fails is harmless: no registry entry ever
+  // matches it, and session cleanup simply drops the stale ownership. Awaited by
+  // callers before the worker launches so ownership is durably persisted first —
+  // a crash in the gap would otherwise leave the repo unowned (a visible seed).
+  const claimDemoRepo = async (
+    targetPath: string | undefined,
+    sessionId: string | undefined,
+  ): Promise<void> => {
+    if (!demoStore || !targetPath || !sessionId) return;
+    await demoStore.claim(targetPath, sessionId);
+  };
+
+  // Erase every repo owned by a demo session, then forget the session. Skips a
+  // repo whose lock is held (analyze/embed in flight) — the idle sweep retries.
+  // Ownership is released only for repos actually torn down, so a skipped repo
+  // stays session-private rather than becoming a visible seed repo.
+  const eraseDemoSession = async (sessionId: string): Promise<void> => {
+    if (!demoStore) return;
+    const ownedPaths = demoStore.reposOwnedBy(sessionId);
+    if (ownedPaths.length === 0) {
+      demoStore.forgetSession(sessionId);
+      return;
+    }
+    const repos = await listRegisteredRepos();
+    const released: string[] = [];
+    let skipped = 0;
+    for (const ownedPath of ownedPaths) {
+      const entry = findEntryByPath(repos, ownedPath);
+      if (!entry) {
+        // Already gone from the registry — just drop the stale ownership.
+        released.push(ownedPath);
+        continue;
+      }
+      const lockKey = getStoragePath(entry.path);
+      // Non-null return means analyze/embed holds the lock — skip; the idle
+      // sweep retries. (Same acquireRepoLock contract as the DELETE route.)
+      if (acquireRepoLock(lockKey) !== null) {
+        skipped++;
+        continue;
+      }
+      try {
+        await eraseRepo(entry);
+        released.push(ownedPath);
+      } catch (err) {
+        logger.warn({ err }, '[demo] failed to erase session repo');
+        skipped++;
+      } finally {
+        releaseRepoLock(lockKey);
+      }
+    }
+    await demoStore.release(released);
+    if (skipped === 0) demoStore.forgetSession(sessionId);
+  };
+
   // Launch the analyze worker for an already-resolved repo directory. Shared by
   // the JSON /api/analyze route and the multipart /api/analyze/upload route.
   const launchAnalysisWorker = createLaunchAnalysisWorker({
@@ -899,6 +1060,37 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     releaseRepoLock,
     closeDbHandle: closeLbug,
   });
+
+  // Demo-mode lifecycle: erase any repos orphaned by a previous run (crash
+  // recovery) at boot, and sweep sessions that have gone idle (a backstop for
+  // when the end-session beacon never arrives). Neither touches seed repos.
+  const DEMO_SESSION_IDLE_MS = 30 * 60 * 1000; // 30 minutes of silence ⇒ session over
+  const DEMO_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+  let demoSweepTimer: ReturnType<typeof setInterval> | undefined;
+  if (demoStore) {
+    void (async () => {
+      try {
+        const orphanPaths = await demoStore.loadOrphans();
+        if (orphanPaths.length === 0) return;
+        const repos = await listRegisteredRepos();
+        for (const orphanPath of orphanPaths) {
+          const entry = findEntryByPath(repos, orphanPath);
+          if (entry) await eraseRepo(entry).catch(() => {});
+        }
+        logger.info({ count: orphanPaths.length }, '[demo] erased orphaned repos at boot');
+      } catch (err) {
+        logger.warn({ err }, '[demo] boot orphan cleanup failed');
+      }
+    })();
+    demoSweepTimer = setInterval(() => {
+      void (async () => {
+        for (const sessionId of demoStore.idleSessions(DEMO_SESSION_IDLE_MS)) {
+          await eraseDemoSession(sessionId).catch(() => {});
+        }
+      })();
+    }, DEMO_SWEEP_INTERVAL_MS);
+    demoSweepTimer.unref?.();
+  }
 
   /**
    * Maximum time the hold-queue will wait for an active analysis job to complete.
@@ -1021,27 +1213,74 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     } else {
       launchContext = 'global';
     }
-    res.json({ version: pkg.version, launchContext, nodeVersion: process.version });
+    res.json({ version: pkg.version, launchContext, nodeVersion: process.version, demo });
   });
 
-  // List all registered repos
-  app.get('/api/repos', async (_req, res) => {
+  // List all registered repos. In demo mode the list is scoped to the caller's
+  // session: seed repos (browsable by everyone) plus any repos this session
+  // added. Each entry is tagged `demoOwned` so the client shows mutation
+  // controls (delete / re-analyze) only for the visitor's own repos.
+  app.get('/api/repos', async (req, res) => {
     try {
       const repos = await listRegisteredRepos();
+      const sessionId = demoStore ? getSessionId(req) : undefined;
+      const visible = demoStore
+        ? repos.filter((r) => demoStore.isSeed(r.path) || demoStore.ownedBy(r.path, sessionId))
+        : repos;
       res.json(
-        repos.map((r) => ({
+        visible.map((r) => ({
           name: r.name,
           path: r.path,
           repoPath: r.path,
           indexedAt: r.indexedAt,
           lastCommit: r.lastCommit,
           stats: r.stats,
+          ...(demoStore ? { demoOwned: demoStore.ownedBy(r.path, sessionId) } : {}),
         })),
       );
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to list repos' });
     }
   });
+
+  // POST /api/demo/end-session — erase every repo the caller's session added.
+  // The web app fires this via navigator.sendBeacon on tab close/hide so a
+  // visitor's repos disappear as soon as they leave; the idle sweep is the
+  // backstop for beacons that never arrive. No-op (and unregistered) outside
+  // demo mode. Always 200 — a best-effort beacon has nothing to act on.
+  //
+  // Guarded like the other write routes (`requireLocalhostOrigin`) so its
+  // protection isn't asymmetric with DELETE /api/repo. This does not block the
+  // real beacon: in the hosted demo the same-origin proxy strips Origin before
+  // the request reaches this server (guard falls through), and a direct local
+  // run sees a loopback Origin (allowed). Only a cross-origin caller reaching an
+  // exposed server is rejected — an unsupported topology the guard exists for.
+  if (demoStore) {
+    app.post(
+      '/api/demo/end-session',
+      createRouteLimiter(),
+      requireLocalhostOrigin,
+      // The beacon posts the session id in a small form body (parsed here);
+      // scoped to this route so global body parsing is unchanged.
+      express.urlencoded({ extended: false, limit: '1kb' }),
+      async (req, res) => {
+        // Accept the session id from the header OR the form body. navigator.
+        // sendBeacon (fired on tab close) cannot set custom headers, so it
+        // sends the id in the body — never the URL query string, which would
+        // leak an ownership key into access/proxy logs.
+        const bodySession = isValidDemoSessionId(req.body?.session) ? req.body.session : undefined;
+        const sessionId = getSessionId(req) ?? bodySession;
+        if (sessionId) {
+          try {
+            await eraseDemoSession(sessionId);
+          } catch (err) {
+            logger.warn({ err }, '[demo] end-session cleanup failed');
+          }
+        }
+        res.json({ ok: true });
+      },
+    );
+  }
 
   // Get repo info
   // Rate-limited (CodeQL js/missing-rate-limiting): resolveRepo canonicalizes
@@ -1091,6 +1330,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
+      // Demo mode: a visitor may only delete a repo their own session added.
+      // Seed repos and other sessions' repos are protected.
+      if (demoStore && !demoStore.ownedBy(entry.path, getSessionId(req))) {
+        res.status(403).json({
+          error: 'GitNexus demo mode: you can only remove repositories you added in this session.',
+        });
+        return;
+      }
+
       // Acquire repo lock — prevents deleting while analyze/embed is in flight
       const lockKey = getStoragePath(entry.path);
       const lockErr = acquireRepoLock(lockKey);
@@ -1100,55 +1348,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
 
       try {
-        // Close any open LadybugDB handle before deleting files
-        try {
-          await closeLbug();
-        } catch {}
-
-        // 1. Delete the .gitnexus index/storage directory
-        const storagePath = getStoragePath(entry.path);
-        await fs.rm(storagePath, { recursive: true, force: true }).catch(() => {});
-
-        // 2. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
-        // getCloneDir now throws on names that are not filesystem-safe (e.g.
-        // local repos registered with names like "my project" or "org/repo").
-        // Such repos legitimately have no clone dir, so treat the rejection as
-        // "nothing to clean up" rather than letting it fail the delete handler.
-        let cloneDir: string | null = null;
-        try {
-          cloneDir = getCloneDir(entry.name);
-        } catch {
-          /* repo name not eligible for a clone dir (local repo) */
-        }
-        // Only remove the clone dir when it is *this* entry's path — a local
-        // repo registered under the same name would otherwise take a cloned
-        // sibling's checkout down with it (see cloneDirBelongsToEntry).
-        if (cloneDir && cloneDirBelongsToEntry(cloneDir, entry.path)) {
-          try {
-            const stat = await fs.stat(cloneDir);
-            if (stat.isDirectory()) {
-              await fs.rm(cloneDir, { recursive: true, force: true });
-            }
-          } catch {
-            /* clone dir may not exist */
-          }
-        }
-
-        // 2b. Delete the uploaded repo dir if entry.path lives under
-        // UPLOAD_ROOT. Drive this off entry.path (not a name-rederived dir) so
-        // a same-named clone is never affected.
-        const resolvedEntry = path.resolve(entry.path);
-        if (resolvedEntry === UPLOAD_ROOT || resolvedEntry.startsWith(UPLOAD_ROOT + path.sep)) {
-          await fs.rm(resolvedEntry, { recursive: true, force: true }).catch(() => {});
-        }
-
-        // 3. Unregister from the global registry
-        const { unregisterRepo } = await import('../storage/repo-manager.js');
-        await unregisterRepo(entry.path);
-
-        // 4. Reinitialize backend to reflect the removal
-        await backend.init().catch(() => {});
-
+        await eraseRepo(entry);
+        if (demoStore) await demoStore.release([entry.path]);
         res.json({ deleted: entry.name });
       } finally {
         releaseRepoLock(lockKey);
@@ -1629,6 +1830,33 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           return;
         }
 
+        // Demo mode: adding a brand-new repo is allowed (it is claimed for this
+        // session below), but re-analyzing an *existing* repo is blocked unless
+        // the caller owns it — protecting seed repos (and other sessions' repos)
+        // from being clobbered. `demoTargetPath` is the directory the worker will
+        // analyze, reused as the ownership key so the claim matches the registry
+        // (derived via the shared cloneTargetForUrl so it can't drift).
+        let demoTargetPath: string | undefined;
+        if (demoStore) {
+          demoTargetPath = repoLocalPath;
+          if (!demoTargetPath && repoUrl) {
+            try {
+              demoTargetPath = cloneTargetForUrl(repoUrl).cloneDir;
+            } catch {
+              /* unresolvable name — fall through, worker surfaces the error */
+            }
+          }
+          if (demoTargetPath) {
+            const existing = findEntryByPath(await listRegisteredRepos(), demoTargetPath);
+            if (existing && !demoStore.ownedBy(existing.path, getSessionId(req))) {
+              res.status(403).json({
+                error: 'GitNexus demo mode: the demo repositories are read-only.',
+              });
+              return;
+            }
+          }
+        }
+
         const job = jobManager.createJob({ repoUrl, repoPath: repoLocalPath });
 
         // If job was already running (dedup), just return its id. The token is
@@ -1647,6 +1875,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           return;
         }
 
+        // Demo mode: claim the repo for this session now (before the worker
+        // registers it) so it is visible only to this visitor and erased with
+        // them, never surfacing as a seed repo mid-analysis.
+        await claimDemoRepo(demoTargetPath, getSessionId(req));
+
         // Mark as active synchronously to prevent race with concurrent requests
         jobManager.updateJob(job.id, { status: 'cloning' });
 
@@ -1656,8 +1889,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           try {
             // Clone if URL provided
             if (repoUrl && !repoLocalPath) {
-              const repoName = extractRepoName(repoUrl);
-              targetPath = getCloneDir(repoName);
+              const { repoName, cloneDir } = cloneTargetForUrl(repoUrl);
+              targetPath = cloneDir;
 
               jobManager.updateJob(job.id, {
                 status: 'cloning',
@@ -1714,6 +1947,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       createJob: (params) => jobManager.createJob(params),
       launch: (job, targetPath, opts) => launchAnalysisWorker(job, targetPath, opts),
       failJob: (jobId, error) => jobManager.updateJob(jobId, { status: 'failed', error }),
+      // Demo mode: an uploaded repo always lands in a fresh dir, so there is no
+      // seed-repo to protect here — just claim it for the uploading session.
+      onJobCreated: (targetPath, req) => claimDemoRepo(targetPath, getSessionId(req)),
     }),
   );
 
@@ -1770,6 +2006,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         const entry = await resolveRepo(requestedRepo(req));
         if (!entry) {
           res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+
+        // Demo mode: embeddings may only be generated for a repo the caller's
+        // session added; seed repos and others' repos are protected.
+        if (demoStore && !demoStore.ownedBy(entry.path, getSessionId(req))) {
+          res.status(403).json({
+            error:
+              'GitNexus demo mode: embeddings can only be generated for repositories you added.',
+          });
           return;
         }
 
@@ -2006,6 +2252,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     const shutdown = async () => {
       console.log('\nShutting down...');
       server.close();
+      if (demoSweepTimer) clearInterval(demoSweepTimer);
       jobManager.dispose();
       embedJobManager.dispose();
       await cleanupMcp();

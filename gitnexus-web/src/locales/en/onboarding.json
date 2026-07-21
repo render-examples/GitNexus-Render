@@ -74,5 +74,8 @@
       "selected": "{{fileCount}} files ready ({{dropped}} skipped: .git, node_modules, build output)",
       "empty": "No analyzable files found in that folder."
     }
+  },
+  "demo": {
+    "sessionBanner": "Demo mode — repositories you add are temporary, visible only to you, and removed when you leave."
   }
 }

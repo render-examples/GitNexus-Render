@@ -14,6 +14,8 @@ import { buildGraphFromConnectResult } from './lib/apply-connect-result';
 import {
   connectToServer,
   fetchRepos,
+  syncDemoMode,
+  endDemoSession,
   normalizeServerUrl,
   connectHeartbeat,
   BackendError,
@@ -59,6 +61,8 @@ const AppContent = () => {
     setServerBaseUrl,
     availableRepos,
     setAvailableRepos,
+    demo,
+    setDemo,
     switchRepo,
     setCurrentRepo,
   } = useAppState();
@@ -207,6 +211,10 @@ const AppContent = () => {
         fetchRepos()
           .then((repos) => setAvailableRepos(repos))
           .catch((e) => console.warn('Failed to fetch repo list:', e));
+        // Learn demo mode so the header scopes mutation controls to session-owned
+        // repos even when arriving via a bookmarked ?server/?repo URL (bypasses
+        // DropZone), and so the end-session cleanup beacon is armed.
+        syncDemoMode(setDemo);
       })
       .catch((err) => {
         console.error('Auto-connect failed:', err);
@@ -221,11 +229,23 @@ const AppContent = () => {
           setProgress(null);
         }, ERROR_RESET_DELAY_MS);
       });
-  }, [handleServerConnect, setProgress, setViewMode, setServerBaseUrl, setAvailableRepos]);
+  }, [handleServerConnect, setProgress, setViewMode, setServerBaseUrl, setAvailableRepos, setDemo]);
 
   const handleFocusNode = useCallback((nodeId: string) => {
     graphCanvasRef.current?.focusNode(nodeId);
   }, []);
+
+  // Demo mode: when the visitor leaves, ask the server to erase the repos this
+  // session added so they never reach the next visitor. `pagehide` is the
+  // reliable "leaving" signal (fires on tab close, navigation, and mobile
+  // backgrounding where `beforeunload` may not); the server's idle sweep is the
+  // backstop if the beacon never arrives.
+  useEffect(() => {
+    if (!demo) return;
+    const onLeave = () => endDemoSession();
+    window.addEventListener('pagehide', onLeave);
+    return () => window.removeEventListener('pagehide', onLeave);
+  }, [demo]);
 
   // Handle settings saved - refresh and reinitialize agent
   // NOTE: Must be defined BEFORE any conditional returns (React hooks rule)

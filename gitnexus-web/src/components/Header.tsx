@@ -71,6 +71,7 @@ export const Header = ({
     rightPanelTab,
     setSettingsPanelOpen,
     setHelpDialogBoxOpen,
+    demo,
   } = useAppState();
   const [searchQuery, setSearchQuery] = useState('');
   const [repoSearchQuery, setRepoSearchQuery] = useState('');
@@ -256,6 +257,11 @@ export const Header = ({
                             filteredRepos.map((repo) => {
                               const identity = repoIdentity(repo);
                               const isActive = identity === activeRepoIdentity;
+                              // Mutation controls (re-analyze / delete) show outside demo
+                              // mode, or in demo mode only for repos this session added.
+                              // Seed repos and other sessions' repos are read-only (the
+                              // server also 403s these mutations — this just hides them).
+                              const canMutate = !demo || repo.demoOwned;
 
                               return (
                                 <div
@@ -286,114 +292,126 @@ export const Header = ({
                                       </span>
                                     )}
                                   </button>
-                                  {/* Re-analyze */}
-                                  <button
-                                    data-testid="repo-switcher-reanalyze"
-                                    onClick={async (e) => {
-                                      e.stopPropagation();
-                                      if (reanalyzing) return; // already running
-                                      setReanalyzing(identity);
-                                      setReanalyzeProgress({
-                                        phase: 'queued',
-                                        percent: 0,
-                                        message: t('common:progress.starting'),
-                                      });
-                                      try {
-                                        const { jobId } = await startAnalyze({
-                                          path: repo.path,
-                                          force: true,
+                                  {/* Re-analyze — in demo mode, only for repos this session added */}
+                                  {canMutate && (
+                                    <button
+                                      data-testid="repo-switcher-reanalyze"
+                                      onClick={async (e) => {
+                                        e.stopPropagation();
+                                        if (reanalyzing) return; // already running
+                                        setReanalyzing(identity);
+                                        setReanalyzeProgress({
+                                          phase: 'queued',
+                                          percent: 0,
+                                          message: t('common:progress.starting'),
                                         });
-                                        reanalyzeSseRef.current = streamAnalyzeProgress(
-                                          jobId,
-                                          (p) => setReanalyzeProgress(p),
-                                          () => {
-                                            setReanalyzing(null);
-                                            setReanalyzeProgress(null);
-                                            reanalyzeSseRef.current = null;
-                                            onAnalyzeComplete?.(identity);
-                                          },
-                                          (errMsg) => {
-                                            console.error('Re-analyze failed:', errMsg);
-                                            setReanalyzing(null);
-                                            setReanalyzeProgress(null);
-                                            reanalyzeSseRef.current = null;
-                                          },
-                                        );
-                                      } catch (err) {
-                                        console.error('Failed to start re-analysis:', err);
-                                        setReanalyzing(null);
-                                        setReanalyzeProgress(null);
-                                      }
-                                    }}
-                                    disabled={!!reanalyzing}
-                                    className={`cursor-pointer rounded p-1 transition-all ${
-                                      reanalyzing === identity
-                                        ? 'text-accent'
-                                        : 'text-text-muted/0 group-hover:text-text-muted hover:!text-accent'
-                                    }`}
-                                    title={
-                                      reanalyzing === identity
-                                        ? t('header:reanalyzing')
-                                        : t('header:reanalyzeRepo', { repoName: repo.name })
-                                    }
-                                  >
-                                    <RefreshCw
-                                      className={`h-3.5 w-3.5 ${reanalyzing === identity ? 'animate-spin' : ''}`}
-                                    />
-                                  </button>
-                                  {/* Delete */}
-                                  <button
-                                    data-testid="repo-switcher-delete"
-                                    onClick={async (e) => {
-                                      e.stopPropagation();
-                                      // Abort any running re-analysis for this repo
-                                      if (reanalyzing === identity) {
-                                        reanalyzeSseRef.current?.abort();
-                                        setReanalyzing(null);
-                                        setReanalyzeProgress(null);
-                                        reanalyzeSseRef.current = null;
-                                      }
-                                      setDeleteError(null);
-                                      try {
-                                        await deleteRepo(identity);
-                                        const updated = await fetchRepos();
-                                        onReposChanged?.(updated);
-                                        // If we deleted the active repo, switch to first available
-                                        if (isActive && updated.length > 0) {
-                                          // Strip the deleted repo's identity from the URL before
-                                          // the fallback switch: the switch success path rewrites
-                                          // them, and if it fails nothing stale must remain that
-                                          // would restore the deleted repo on refresh (#2419).
-                                          const urlObj = new URL(window.location.href);
-                                          urlObj.searchParams.delete('repo');
-                                          urlObj.searchParams.delete('project');
-                                          window.history.replaceState(null, '', urlObj.toString());
-                                          onSwitchRepo?.(repoIdentity(updated[0]));
-                                        } else if (updated.length === 0) {
-                                          // No repos left — go back to onboarding. Strip the
-                                          // restore params first so the reload lands on
-                                          // onboarding instead of deterministically 404-flashing
-                                          // on the just-deleted repo (#2419).
-                                          const urlObj = new URL(window.location.href);
-                                          urlObj.searchParams.delete('repo');
-                                          urlObj.searchParams.delete('project');
-                                          urlObj.searchParams.delete('skipGraph');
-                                          window.history.replaceState(null, '', urlObj.toString());
-                                          window.location.reload();
+                                        try {
+                                          const { jobId } = await startAnalyze({
+                                            path: repo.path,
+                                            force: true,
+                                          });
+                                          reanalyzeSseRef.current = streamAnalyzeProgress(
+                                            jobId,
+                                            (p) => setReanalyzeProgress(p),
+                                            () => {
+                                              setReanalyzing(null);
+                                              setReanalyzeProgress(null);
+                                              reanalyzeSseRef.current = null;
+                                              onAnalyzeComplete?.(identity);
+                                            },
+                                            (errMsg) => {
+                                              console.error('Re-analyze failed:', errMsg);
+                                              setReanalyzing(null);
+                                              setReanalyzeProgress(null);
+                                              reanalyzeSseRef.current = null;
+                                            },
+                                          );
+                                        } catch (err) {
+                                          console.error('Failed to start re-analysis:', err);
+                                          setReanalyzing(null);
+                                          setReanalyzeProgress(null);
                                         }
-                                      } catch (err) {
-                                        // Surface the failure instead of silently no-opping —
-                                        // e.g. an origin-blocked 403 when driving a local
-                                        // backend from the hosted UI.
-                                        console.error('Failed to delete repo:', err);
-                                        setDeleteError(formatBackendError(err, t));
+                                      }}
+                                      disabled={!!reanalyzing}
+                                      className={`cursor-pointer rounded p-1 transition-all ${
+                                        reanalyzing === identity
+                                          ? 'text-accent'
+                                          : 'text-text-muted/0 group-hover:text-text-muted hover:!text-accent'
+                                      }`}
+                                      title={
+                                        reanalyzing === identity
+                                          ? t('header:reanalyzing')
+                                          : t('header:reanalyzeRepo', { repoName: repo.name })
                                       }
-                                    }}
-                                    className="cursor-pointer rounded p-1 text-text-muted/0 transition-all group-hover:text-text-muted hover:!text-red-400"
-                                    title={t('header:deleteRepo', { repoName: repo.name })}
-                                  >
-                                    <Trash2 className="h-3.5 w-3.5" />
-                                  </button>
+                                    >
+                                      <RefreshCw
+                                        className={`h-3.5 w-3.5 ${reanalyzing === identity ? 'animate-spin' : ''}`}
+                                      />
+                                    </button>
+                                  )}
+                                  {/* Delete — in demo mode, only for repos this session added */}
+                                  {canMutate && (
+                                    <button
+                                      data-testid="repo-switcher-delete"
+                                      onClick={async (e) => {
+                                        e.stopPropagation();
+                                        // Abort any running re-analysis for this repo
+                                        if (reanalyzing === identity) {
+                                          reanalyzeSseRef.current?.abort();
+                                          setReanalyzing(null);
+                                          setReanalyzeProgress(null);
+                                          reanalyzeSseRef.current = null;
+                                        }
+                                        setDeleteError(null);
+                                        try {
+                                          await deleteRepo(identity);
+                                          const updated = await fetchRepos();
+                                          onReposChanged?.(updated);
+                                          // If we deleted the active repo, switch to first available
+                                          if (isActive && updated.length > 0) {
+                                            // Strip the deleted repo's identity from the URL before
+                                            // the fallback switch: the switch success path rewrites
+                                            // them, and if it fails nothing stale must remain that
+                                            // would restore the deleted repo on refresh (#2419).
+                                            const urlObj = new URL(window.location.href);
+                                            urlObj.searchParams.delete('repo');
+                                            urlObj.searchParams.delete('project');
+                                            window.history.replaceState(
+                                              null,
+                                              '',
+                                              urlObj.toString(),
+                                            );
+                                            onSwitchRepo?.(repoIdentity(updated[0]));
+                                          } else if (updated.length === 0) {
+                                            // No repos left — go back to onboarding. Strip the
+                                            // restore params first so the reload lands on
+                                            // onboarding instead of deterministically 404-flashing
+                                            // on the just-deleted repo (#2419).
+                                            const urlObj = new URL(window.location.href);
+                                            urlObj.searchParams.delete('repo');
+                                            urlObj.searchParams.delete('project');
+                                            urlObj.searchParams.delete('skipGraph');
+                                            window.history.replaceState(
+                                              null,
+                                              '',
+                                              urlObj.toString(),
+                                            );
+                                            window.location.reload();
+                                          }
+                                        } catch (err) {
+                                          // Surface the failure instead of silently no-opping —
+                                          // e.g. an origin-blocked 403 when driving a local
+                                          // backend from the hosted UI.
+                                          console.error('Failed to delete repo:', err);
+                                          setDeleteError(formatBackendError(err, t));
+                                        }
+                                      }}
+                                      className="cursor-pointer rounded p-1 text-text-muted/0 transition-all group-hover:text-text-muted hover:!text-red-400"
+                                      title={t('header:deleteRepo', { repoName: repo.name })}
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  )}
                                 </div>
                               );
                             })
@@ -436,7 +454,7 @@ export const Header = ({
                       </div>
                     )}
 
-                    {/* Analyze new */}
+                    {/* Analyze new — available in demo mode too (repos are session-private) */}
                     <div
                       className={
                         availableRepos.length > 0 || reanalyzing

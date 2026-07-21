@@ -15,6 +15,7 @@
 import { Sparkles, ArrowRight, GitBranch, FileCode, Layers } from '@/lib/lucide-icons';
 import { RepoAnalyzer } from './RepoAnalyzer';
 import { repoIdentity, type BackendRepo } from '../services/backend-client';
+import { useAppState } from '../hooks/useAppState';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 
@@ -97,6 +98,7 @@ interface RepoLandingProps {
 
 export const RepoLanding = ({ repos, onSelectRepo, onAnalyzeComplete }: RepoLandingProps) => {
   const { t } = useTranslation('onboarding');
+  const { demo } = useAppState();
 
   return (
     <div className="relative animate-fade-in overflow-hidden rounded-3xl border border-border-default bg-surface p-7">
@@ -148,9 +150,9 @@ export const RepoLanding = ({ repos, onSelectRepo, onAnalyzeComplete }: RepoLand
         <RepoAnalyzer variant="onboarding" onComplete={onAnalyzeComplete} />
       </div>
 
-      {/* Footer hint */}
+      {/* Footer hint — in demo mode, note that added repos are session-private */}
       <p className="mt-5 text-center text-[11px] leading-relaxed text-text-muted">
-        {t('landing.footer')}
+        {demo ? t('demo.sessionBanner') : t('landing.footer')}
       </p>
     </div>
   );

@@ -74,5 +74,8 @@
       "selected": "已准备 {{fileCount}} 个文件（已跳过 {{dropped}} 个：.git、node_modules、构建产物）",
       "empty": "该文件夹中未找到可分析的文件。"
     }
+  },
+  "demo": {
+    "sessionBanner": "演示模式 — 你添加的代码库是临时的，仅你自己可见，离开后会被删除。"
   }
 }

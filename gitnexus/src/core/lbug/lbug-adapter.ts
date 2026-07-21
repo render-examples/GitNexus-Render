@@ -2016,6 +2016,25 @@ export const closeLbug = async (): Promise<void> => {
 };
 
 /**
+ * Close the single global connection only if it currently has `dbPath` open;
+ * otherwise leave it untouched. Returns true iff it closed.
+ *
+ * This connection is a switch-on-demand cache shared by every direct query
+ * route (see {@link withLbugDb}): only one repo's DB is open at a time, and a
+ * repo that isn't the open one holds no handle here. A caller tearing down one
+ * repo can therefore release its file handle — without aborting an unrelated
+ * in-flight query on a *different* repo — by closing only when this repo is the
+ * open one. `dbPath` must be byte-identical to the path the query routes open
+ * with (`path.join(entry.storagePath, 'lbug')`), which is exactly what reuse in
+ * {@link ensureLbugInitialized} already relies on.
+ */
+export const closeLbugIfOpen = async (dbPath: string): Promise<boolean> => {
+  if (currentDbPath !== dbPath) return false;
+  await closeLbug();
+  return true;
+};
+
+/**
  * Thrown by {@link wipeLbugDbFiles} when a data-bearing member of the
  * LadybugDB file family is still present after the bounded
  * remove-and-verify retries (#2409, tri-review 4669518496 P2-4), and by

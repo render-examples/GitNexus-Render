@@ -181,6 +181,9 @@ interface AppState {
   setServerBaseUrl: (url: string | null) => void;
   availableRepos: BackendRepo[];
   setAvailableRepos: (repos: BackendRepo[]) => void;
+  /** Read-only demo mode, learned from the server via GET /api/info. */
+  demo: boolean;
+  setDemo: (demo: boolean) => void;
   switchRepo: (repoName: string) => Promise<void>;
   setCurrentRepo: (repoName: string | undefined) => void;
   /** Download the full graph for the current repo after a chat-only connect (#2178). */
@@ -367,6 +370,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
   // Multi-repo switching
   const [serverBaseUrl, setServerBaseUrl] = useState<string | null>(null);
   const [availableRepos, setAvailableRepos] = useState<BackendRepo[]>([]);
+  const [demo, setDemo] = useState(false);
 
   // Embedding state
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus>('idle');
@@ -1550,6 +1554,8 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
     setServerBaseUrl,
     availableRepos,
     setAvailableRepos,
+    demo,
+    setDemo,
     switchRepo,
     setCurrentRepo,
     loadGraphAnyway,

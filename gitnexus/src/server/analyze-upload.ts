@@ -16,6 +16,7 @@ import { ingestUpload } from './upload-ingest.js';
 import { UPLOAD_ROOT, getUploadDir, deriveUploadName } from './upload-paths.js';
 import { BadRequestError } from './validation.js';
 import type { AnalyzeJob } from './analyze-job.js';
+import { logger } from '../core/logger.js';
 
 /** Minimal job shape the handler needs (a subset of the real AnalyzeJob). */
 export type UploadJobRef = Pick<AnalyzeJob, 'id' | 'status'>;
@@ -34,6 +35,16 @@ export interface AnalyzeUploadDeps {
    * leaked non-terminal job wedges all future analyses until restart.
    */
   failJob: (jobId: string, error: string) => void;
+  /**
+   * Called once the analysis job has been created (and the single analysis slot
+   * taken), before the worker launches. `targetPath` is the directory that will
+   * be analyzed and registered. Lets the server associate the repo with the
+   * requesting session in demo mode. Best-effort: awaited so a durable side
+   * effect (e.g. persisting session ownership) completes before the worker
+   * launches, but any error it throws is caught and logged — the analysis
+   * proceeds regardless.
+   */
+  onJobCreated?: (targetPath: string, req: Request) => void | Promise<void>;
   /** Injectable for tests (defaults to the real ingestUpload). */
   ingest?: typeof ingestUpload;
 }
@@ -113,6 +124,15 @@ export function createAnalyzeUploadHandler(deps: AnalyzeUploadDeps) {
         throw err;
       }
       createdJobId = job.id;
+      // Best-effort side effect: the analysis slot is already taken, so a
+      // throwing hook must not fail the job (which would wedge future
+      // analyses). Guard it here rather than trusting every impl to be
+      // non-throwing.
+      try {
+        await deps.onJobCreated?.(finalDir, req);
+      } catch (err) {
+        logger.warn({ err }, '[analyze-upload] onJobCreated hook failed');
+      }
 
       // Promote staging → persistent upload dir. Both live under UPLOAD_ROOT's
       // filesystem, so this rename stays atomic (no EXDEV).
