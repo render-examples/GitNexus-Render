@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
+import { connect } from 'node:net';
 import http, { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -709,6 +710,72 @@ it('does NOT buffer or retry a body larger than the retry cap', async () => {
     assert.equal(receivedLen, bigBody.length, 'full body reaches upstream (not truncated to cap)');
   } finally {
     await killAndWait(proc);
+    await new Promise((r) => upstreamServer.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it('returns 400 when the client declares a body but never finishes sending it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-bodytimeout-'));
+  await mkdir(join(dir, 'dist'), { recursive: true });
+  await writeFile(join(dir, 'dist', 'index.html'), '<html><body>spa</body></html>');
+
+  // Live upstream so a failure to reach it can't be mistaken for the body
+  // timeout. It must see zero requests: the proxy never connects because the
+  // buffering read times out first.
+  let served = 0;
+  const upstreamServer = createServer((req, res) => {
+    served += 1;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await new Promise((resolve) => {
+    upstreamServer.listen(0, '127.0.0.1', () => resolve(upstreamServer.address().port));
+  });
+
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${upstreamPort}`,
+    // Small body-read budget so a stalled client trips the timeout quickly.
+    GITNEXUS_PROXY_TIMEOUT_MS: '300',
+  });
+
+  // Raw socket (not http.request, which would auto-finish the body): send a
+  // Content-Length: 100 request but only 10 bytes, then hold the socket open.
+  const rawStalledPost = () =>
+    new Promise((resolve, reject) => {
+      const sock = connect(port, '127.0.0.1', () => {
+        sock.write(
+          'POST /api/analyze HTTP/1.1\r\n' +
+            'Host: 127.0.0.1\r\n' +
+            'Content-Type: application/json\r\n' +
+            'Content-Length: 100\r\n' +
+            '\r\n' +
+            'x'.repeat(10), // fewer than 100 bytes, then stall
+        );
+      });
+      let buf = '';
+      sock.setEncoding('utf8');
+      sock.on('data', (chunk) => {
+        buf += chunk;
+        const statusLine = buf.split('\r\n', 1)[0];
+        const m = statusLine.match(/^HTTP\/\d\.\d (\d{3})/);
+        if (m) {
+          sock.destroy();
+          resolve(Number(m[1]));
+        }
+      });
+      sock.on('error', reject);
+    });
+
+  try {
+    await waitForServer(port);
+    const status = await rawStalledPost();
+    assert.equal(status, 400, 'stalled body read must be bounded and return 400, not hang');
+    assert.equal(served, 0, 'proxy must not connect upstream when the body never arrives');
+  } finally {
+    await killAndWait(proc);
+    upstreamServer.closeAllConnections?.();
     await new Promise((r) => upstreamServer.close(r));
     await rm(dir, { recursive: true, force: true });
   }

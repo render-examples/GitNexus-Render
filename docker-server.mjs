@@ -94,15 +94,20 @@ const retryableProxyCodes = new Set([
 ]);
 
 // Read a request body into a single Buffer, capping total size. Resolves null
-// if the body exceeds `cap` or the client errors mid-read (so the caller can
-// fall back to a single streamed attempt instead of buffering). Listeners are
-// detached once settled so a later pipe of the same request is unaffected.
-function readBodyCapped(req, cap) {
+// if the body exceeds `cap`, the client errors mid-read, OR the read exceeds
+// `timeoutMs` (so the caller can fall back to a single streamed attempt instead
+// of buffering, or reject an unreadable body). A single "unreadable body ->
+// null" contract keeps the caller simple; it already maps null -> 400.
+// Listeners and the timer are detached once settled so a later pipe of the same
+// request is unaffected and a settled request never fires a stray callback.
+function readBodyCapped(req, cap, timeoutMs) {
   return new Promise((resolvePromise) => {
     const chunks = [];
     let total = 0;
     let settled = false;
+    let timer = null;
     const cleanup = () => {
+      if (timer) clearTimeout(timer);
       req.removeListener('data', onData);
       req.removeListener('end', onEnd);
       req.removeListener('error', onError);
@@ -126,6 +131,16 @@ function readBodyCapped(req, cap) {
     req.on('data', onData);
     req.on('end', onEnd);
     req.on('error', onError);
+    // Idle-agnostic hard cap on how long we'll wait for the full body — the
+    // reverse-proxy equivalent of nginx's client_body_timeout. Reuses the
+    // proxyTimeoutMs knob; 0 disables it, mirroring the upstream timeout. Node's
+    // default server requestTimeout remains the outer backstop.
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        console.warn(`[gitnexus-web] client body read timed out after ${timeoutMs}ms`);
+        finish(null);
+      }, timeoutMs);
+    }
   });
 }
 
@@ -185,9 +200,11 @@ async function proxyToUpstream(req, res) {
   const small = Number.isFinite(len) && len >= 0 && len <= proxyRetryMaxBodyBytes;
   let bodyBuf = hasBody ? null : Buffer.alloc(0);
   if (hasBody && small) {
-    bodyBuf = await readBodyCapped(req, proxyRetryMaxBodyBytes);
+    bodyBuf = await readBodyCapped(req, proxyRetryMaxBodyBytes, proxyTimeoutMs);
     if (bodyBuf === null) {
-      // Overflowed the cap or the client errored mid-read.
+      // Overflowed the cap, the client errored mid-read, or the read timed out.
+      // Kept as a single 400 (not split into 408/413) — the overflow->400
+      // behavior was not flagged, so preserve it deliberately.
       if (!res.headersSent) {
         res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end('Bad request');
@@ -309,7 +326,18 @@ const server = createServer(async (req, res) => {
   // Same-origin API proxy: forward `/api/*` to the upstream server when
   // configured. Everything else is served as a static asset / SPA below.
   if (upstreamBase && (urlPath === '/api' || urlPath.startsWith('/api/'))) {
-    proxyToUpstream(req, res);
+    // proxyToUpstream is async and invoked fire-and-forget; guard the boundary
+    // so a future await added inside it can't become an unhandledRejection.
+    // Mirror the 502 / res.destroy() shape used inside its own error handler.
+    proxyToUpstream(req, res).catch((err) => {
+      console.error('[gitnexus-web] proxy handler crashed:', err?.message ?? err);
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Bad gateway');
+      } else {
+        res.destroy();
+      }
+    });
     return;
   }
 
