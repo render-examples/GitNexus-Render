@@ -35,6 +35,21 @@ function validHttpUrl(label, value) {
   return null;
 }
 
+// Parse a numeric env var. Unset/empty falls back to `fallback`. A set but
+// non-numeric value warns (like validHttpUrl) and also falls back, instead of
+// silently yielding NaN — which would quietly disable a timeout/retry knob.
+function numberFromEnv(label, fallback) {
+  const raw = process.env[label];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    const safeRaw = raw.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200);
+    console.warn(`[gitnexus-web] ${label} "${safeRaw}" is not a number -- using ${fallback}.`);
+    return fallback;
+  }
+  return n;
+}
+
 // Falls back to RENDER_EXTERNAL_URL so a Render web service serves its own
 // public origin to the browser (same-origin API calls via the proxy below)
 // with no manual configuration.
@@ -69,15 +84,16 @@ const upstreamBase = validHttpUrl('GITNEXUS_UPSTREAM_URL', rawUpstreamUrl);
 // streams any bytes for this long, fail with 504 instead of holding the
 // browser connection open forever. Socket activity (e.g. SSE heartbeats)
 // resets it, so long-lived streams are unaffected. 0 disables the timeout.
-const proxyTimeoutMs = Number(process.env.GITNEXUS_PROXY_TIMEOUT_MS || '120000');
+const proxyTimeoutMs = numberFromEnv('GITNEXUS_PROXY_TIMEOUT_MS', 120000);
 
 // How long the proxy will wait to buffer a replayable client body before giving
 // up with 400 — the reverse-proxy equivalent of nginx's client_body_timeout.
 // Defaults to proxyTimeoutMs so the single-knob setup still works, but can be
 // tuned independently of the upstream idle timeout. 0 disables it (Node's
 // server requestTimeout remains the outer backstop).
-const proxyClientBodyTimeoutMs = Number(
-  process.env.GITNEXUS_PROXY_CLIENT_BODY_TIMEOUT_MS || String(proxyTimeoutMs),
+const proxyClientBodyTimeoutMs = numberFromEnv(
+  'GITNEXUS_PROXY_CLIENT_BODY_TIMEOUT_MS',
+  proxyTimeoutMs,
 );
 
 // Bounded connection-retry for proxied requests. A single-instance upstream
@@ -93,11 +109,9 @@ const proxyClientBodyTimeoutMs = Number(
 // only BEFORE any response byte reaches the browser, only for a small
 // buffered/replayable body, and keep it bounded so a genuinely-down upstream
 // still fails fast. Set attempts to 1 to disable (also skips body buffering).
-const proxyRetryAttempts = Math.max(1, Number(process.env.GITNEXUS_PROXY_RETRY_ATTEMPTS || '3'));
+const proxyRetryAttempts = Math.max(1, numberFromEnv('GITNEXUS_PROXY_RETRY_ATTEMPTS', 3));
 const proxyRetryEnabled = proxyRetryAttempts > 1;
-const proxyRetryMaxBodyBytes = Number(
-  process.env.GITNEXUS_PROXY_RETRY_MAX_BODY_BYTES || String(256 * 1024),
-);
+const proxyRetryMaxBodyBytes = numberFromEnv('GITNEXUS_PROXY_RETRY_MAX_BODY_BYTES', 256 * 1024);
 // Connection-establishment failures: the socket never reached the upstream, so
 // it received nothing and replaying is safe for ANY method (including a POST).
 const preConnectRetryCodes = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
