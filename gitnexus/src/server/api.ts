@@ -1229,22 +1229,34 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // visitor's repos disappear as soon as they leave; the idle sweep is the
   // backstop for beacons that never arrive. No-op (and unregistered) outside
   // demo mode. Always 200 — a best-effort beacon has nothing to act on.
+  //
+  // Guarded like the other write routes (`requireLocalhostOrigin`) so its
+  // protection isn't asymmetric with DELETE /api/repo. This does not block the
+  // real beacon: in the hosted demo the same-origin proxy strips Origin before
+  // the request reaches this server (guard falls through), and a direct local
+  // run sees a loopback Origin (allowed). Only a cross-origin caller reaching an
+  // exposed server is rejected — an unsupported topology the guard exists for.
   if (demoStore) {
-    app.post('/api/demo/end-session', createRouteLimiter(), async (req, res) => {
-      // Accept the session id from the header OR a `?session=` query param:
-      // navigator.sendBeacon (fired on tab close) cannot set custom headers.
-      const rawQuery = req.query.session;
-      const querySession = isValidDemoSessionId(rawQuery) ? rawQuery : undefined;
-      const sessionId = getSessionId(req) ?? querySession;
-      if (sessionId) {
-        try {
-          await eraseDemoSession(sessionId);
-        } catch (err) {
-          logger.warn({ err }, '[demo] end-session cleanup failed');
+    app.post(
+      '/api/demo/end-session',
+      createRouteLimiter(),
+      requireLocalhostOrigin,
+      async (req, res) => {
+        // Accept the session id from the header OR a `?session=` query param:
+        // navigator.sendBeacon (fired on tab close) cannot set custom headers.
+        const rawQuery = req.query.session;
+        const querySession = isValidDemoSessionId(rawQuery) ? rawQuery : undefined;
+        const sessionId = getSessionId(req) ?? querySession;
+        if (sessionId) {
+          try {
+            await eraseDemoSession(sessionId);
+          } catch (err) {
+            logger.warn({ err }, '[demo] end-session cleanup failed');
+          }
         }
-      }
-      res.json({ ok: true });
-    });
+        res.json({ ok: true });
+      },
+    );
   }
 
   // Get repo info
