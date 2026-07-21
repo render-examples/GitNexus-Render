@@ -63,12 +63,15 @@ Because the server keeps state on a disk, it runs as a single instance.
 2. Render reads [`render.yaml`](render.yaml) and provisions both services plus the disk.
 3. Wait for both services to go **live**, then open the `gitnexus-web` URL.
 
-No environment variables are required for the core app. Two are optional:
+No environment variables are required for the core app. A few are optional:
 
 | Env var | Service | Required? | What it's for |
 |---------|---------|-----------|---------------|
+| `DEMO` | `gitnexus-server` | Optional | Set to `true` to enable public, session-isolated demo mode. **Must be on `gitnexus-server`, not `gitnexus-web`** — see [Demo mode](#demo-mode). |
 | `AZURE_DEVOPS_URL` | `gitnexus-server` | Optional | Base URL of an Azure DevOps Server instance to index from. |
 | `AZURE_DEVOPS_PAT` | `gitnexus-server` | Optional | Personal access token for that instance (marked `sync: false` — Render prompts you for it; it is never committed). |
+
+Every backend env var in this template belongs on **`gitnexus-server`**. The `gitnexus-web` service is only a static UI + same-origin reverse proxy and reads none of them.
 
 Leave both unset to skip the Azure DevOps integration.
 
@@ -102,6 +105,8 @@ When a repo exceeds the available memory, the indexing worker aborts and the **j
 ## Demo mode
 
 Demo mode is **off by default**. For public, shareable deployments, enable it by setting `DEMO=true` in the Render dashboard on **`gitnexus-server` only** (`render.yaml` marks it `sync: false`, so it's dashboard-managed and a Blueprint sync never overrides it). The web UI picks it up automatically via `GET /api/info` — no env var on `gitnexus-web`. In demo mode visitors can still index their own repositories, but each added repo is private to the browser session that created it and is erased when that session ends; the pre-indexed "seed" repos stay browsable by everyone and are read-only. Leave `DEMO` unset for a normal single-tenant deploy.
+
+> **⚠️ Set `DEMO` on `gitnexus-server`, not `gitnexus-web`.** Only the API server process reads `DEMO`; setting it on the `gitnexus-web` service has **no effect** and demo mode stays off. After setting it, restart/redeploy `gitnexus-server` (the `sync: false` var only applies on restart) and confirm the startup log reads `Demo mode enabled (DEMO)`. If it reads `Demo mode disabled (DEMO not truthy)`, the value didn't take — check that it's on the server service and is a truthy value (`true`, `1`, or `yes`).
 
 ## Security notes
 
