@@ -1986,9 +1986,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         // early-return below and before the worker registers it — so it is
         // visible only to this visitor and erased with them, never surfacing as
         // a seed repo. Claiming ahead of the dedup return is essential: when a
-        // concurrent duplicate request is folded into an existing in-flight job,
-        // this request would otherwise return without ever claiming, leaving the
-        // repo unowned. Re-claiming an already-claimed path is idempotent.
+        // duplicate request is folded into an existing in-flight job, this
+        // request would otherwise return without ever claiming, leaving the repo
+        // unowned. For the same session (a double-click/retry) the re-claim is
+        // idempotent. NOTE: two *different* sessions analyzing the same URL map
+        // to one shared clone dir, so this last-writer-wins re-claim hands
+        // ownership to the later request (the repo stays session-private either
+        // way — no public leak). Accepted limitation of the URL-keyed clone dir;
+        // a per-session clone dir would remove the collision (tracked separately).
         await claimDemoRepo(demoTargetPath, getSessionId(req));
 
         // If job was already running (dedup), just return its id. The token is
