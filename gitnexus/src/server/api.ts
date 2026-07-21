@@ -863,10 +863,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // demo-store.ts. Read routes are untouched.
   const demo = parseTruthyEnv(process.env.DEMO);
   const demoStore = demo ? new DemoStore() : null;
+  // Always log the demo-mode state on startup so operators can confirm from the
+  // logs whether DEMO took effect (a dashboard-set, sync:false var only applies
+  // after a restart/redeploy). `demoRaw` echoes the raw env value (never a
+  // secret) so a mis-set value like `"on"` or a stray space is diagnosable.
+  const demoRaw = process.env.DEMO;
   if (demo) {
     logger.info(
+      { demo, demoRaw },
       '[gitnexus serve] Demo mode enabled (DEMO): visitor repositories are private to their ' +
         'session and erased when the session ends; seed repositories are read-only.',
+    );
+  } else {
+    logger.info(
+      { demo, demoRaw },
+      '[gitnexus serve] Demo mode disabled (DEMO not truthy): all registered repositories are ' +
+        'shared and mutable. Set DEMO=true and restart to enable per-session isolation.',
     );
   }
 
