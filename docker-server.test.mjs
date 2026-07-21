@@ -267,17 +267,30 @@ it('does not inject config into static assets', async () => {
 // -- API reverse proxy (GITNEXUS_UPSTREAM_URL) -----------------------------
 
 function rawRequest(port, path, { method = 'GET', headers = {}, body } = {}) {
+  // Mirror how a browser's fetch() sends a string/buffer body: with an explicit
+  // Content-Length (not chunked). The proxy's retry path only buffers requests
+  // whose length is known, so tests must send one to exercise it realistically.
+  const outHeaders = { ...headers };
+  if (
+    body !== undefined &&
+    !Object.keys(outHeaders).some((h) => h.toLowerCase() === 'content-length')
+  ) {
+    outHeaders['content-length'] = String(Buffer.byteLength(body));
+  }
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
-      let respBody = '';
-      res.setEncoding('utf8');
-      res.on('data', (chunk) => {
-        respBody += chunk;
-      });
-      res.on('end', () =>
-        resolve({ status: res.statusCode, headers: res.headers, body: respBody }),
-      );
-    });
+    const req = http.request(
+      { host: '127.0.0.1', port, path, method, headers: outHeaders },
+      (res) => {
+        let respBody = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          respBody += chunk;
+        });
+        res.on('end', () =>
+          resolve({ status: res.statusCode, headers: res.headers, body: respBody }),
+        );
+      },
+    );
     req.on('error', reject);
     if (body !== undefined) req.write(body);
     req.end();
@@ -494,6 +507,8 @@ it('returns 502 when the upstream is unreachable', async () => {
   const port = await getFreePort();
   const proc = spawnServerWithEnv(dir, port, {
     GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${deadPort}`,
+    // Disable retry so this fails fast (the unreachable-upstream contract).
+    GITNEXUS_PROXY_RETRY_ATTEMPTS: '1',
   });
   try {
     await waitForServer(port);
@@ -501,6 +516,200 @@ it('returns 502 when the upstream is unreachable', async () => {
     assert.equal(res.status, 502);
   } finally {
     await killAndWait(proc);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// -- Connection-retry across an upstream restart window ---------------------
+
+// A fake upstream that refuses the first `failFirst` connections (by not
+// listening) then binds on the same port, mimicking a single-instance server
+// restart. Retries in the proxy should absorb the gap so the first browser
+// request still succeeds. `started` counts served requests.
+async function withFlakyUpstream(failFirst, envOverrides, fn) {
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-retry-'));
+  await mkdir(join(dir, 'dist'), { recursive: true });
+  await writeFile(join(dir, 'dist', 'index.html'), '<html><body>spa</body></html>');
+
+  const upstreamPort = await getFreePort(); // fixed port we bind late
+  const state = { served: 0, lastBody: null };
+  let upstreamServer = null;
+  // Bind the upstream only after a short delay, so the first proxy attempt(s)
+  // hit ECONNREFUSED (nothing listening) and must retry.
+  const bindDelay = failFirst > 0 ? 400 : 0;
+  const bindTimer = setTimeout(() => {
+    upstreamServer = createServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (c) => {
+        body += c;
+      });
+      req.on('end', () => {
+        state.served += 1;
+        state.lastBody = body;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"ok":true}');
+      });
+    });
+    upstreamServer.listen(upstreamPort, '127.0.0.1');
+  }, bindDelay);
+
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${upstreamPort}`,
+    ...envOverrides,
+  });
+  try {
+    await waitForServer(port);
+    await fn(port, state);
+  } finally {
+    clearTimeout(bindTimer);
+    await killAndWait(proc);
+    if (upstreamServer) await new Promise((r) => upstreamServer.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+it('retries a connection-refused POST and succeeds once the upstream is up', async () => {
+  // Upstream binds after ~400ms; the default 3 attempts (backoff 250ms, 500ms)
+  // span ~750ms, so a retry should land after the upstream comes up.
+  await withFlakyUpstream(1, {}, async (port, state) => {
+    const res = await rawRequest(port, '/api/analyze', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"repo":"x"}',
+    });
+    assert.equal(res.status, 200, 'first attempt should ride out the restart gap');
+    assert.match(res.body, /"ok":true/);
+    assert.equal(state.served, 1, 'upstream must run the job exactly once (no double-execute)');
+    assert.equal(state.lastBody, '{"repo":"x"}', 'buffered body replayed intact');
+  });
+});
+
+it('returns 502 after exhausting the retry budget when the upstream stays down', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-retry-down-'));
+  await mkdir(join(dir, 'dist'), { recursive: true });
+  await writeFile(join(dir, 'dist', 'index.html'), '<html><body>spa</body></html>');
+  const deadPort = await getFreePort(); // nothing ever listens here
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${deadPort}`,
+    GITNEXUS_PROXY_RETRY_ATTEMPTS: '3',
+  });
+  try {
+    await waitForServer(port);
+    const res = await rawRequest(port, '/api/analyze', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"repo":"x"}',
+    });
+    assert.equal(res.status, 502, 'genuinely-down upstream still returns 502 after the budget');
+  } finally {
+    await killAndWait(proc);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it('does NOT retry after the upstream starts streaming, then drops mid-body', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-midbody-'));
+  await mkdir(join(dir, 'dist'), { recursive: true });
+  await writeFile(join(dir, 'dist', 'index.html'), '<html><body>spa</body></html>');
+
+  let calls = 0;
+  const upstreamServer = createServer((req, res) => {
+    calls += 1;
+    // Send headers + a partial body, then abruptly destroy the socket.
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.write('{"partial":');
+    setTimeout(() => res.socket.destroy(), 20);
+  });
+  const upstreamPort = await new Promise((resolve) => {
+    upstreamServer.listen(0, '127.0.0.1', () => resolve(upstreamServer.address().port));
+  });
+
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${upstreamPort}`,
+    GITNEXUS_PROXY_RETRY_ATTEMPTS: '3',
+  });
+  // Issue a request that settles on end OR on the mid-body abort/error, so the
+  // dropped connection can't hang the test. What matters is the proxy did NOT
+  // replay the request (no duplicate job): the upstream must see exactly 1 call.
+  const requestUntilSettled = () =>
+    new Promise((resolve) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1',
+          port,
+          path: '/api/analyze',
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-length': '12' },
+        },
+        (res) => {
+          res.on('data', () => {});
+          res.on('end', resolve);
+          res.on('aborted', resolve);
+          res.on('error', resolve);
+        },
+      );
+      req.on('error', resolve);
+      req.write('{"repo":"x"}');
+      req.end();
+    });
+  try {
+    await waitForServer(port);
+    await requestUntilSettled();
+    // Give any (erroneous) retry a chance to fire before asserting.
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(calls, 1, 'must not replay once the response body has started');
+  } finally {
+    await killAndWait(proc);
+    upstreamServer.closeAllConnections?.();
+    await new Promise((r) => upstreamServer.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it('does NOT buffer or retry a body larger than the retry cap', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-bigbody-'));
+  await mkdir(join(dir, 'dist'), { recursive: true });
+  await writeFile(join(dir, 'dist', 'index.html'), '<html><body>spa</body></html>');
+
+  let receivedLen = -1;
+  const upstreamServer = createServer((req, res) => {
+    let len = 0;
+    req.on('data', (c) => {
+      len += c.length;
+    });
+    req.on('end', () => {
+      receivedLen = len;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+  });
+  const upstreamPort = await new Promise((resolve) => {
+    upstreamServer.listen(0, '127.0.0.1', () => resolve(upstreamServer.address().port));
+  });
+
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${upstreamPort}`,
+    // Tiny cap so a modest body exceeds it and is streamed, not buffered.
+    GITNEXUS_PROXY_RETRY_MAX_BODY_BYTES: '16',
+  });
+  const bigBody = 'x'.repeat(1024);
+  try {
+    await waitForServer(port);
+    const res = await rawRequest(port, '/api/analyze/upload', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: bigBody,
+    });
+    assert.equal(res.status, 200, 'over-cap body is streamed straight through');
+    assert.equal(receivedLen, bigBody.length, 'full body reaches upstream (not truncated to cap)');
+  } finally {
+    await killAndWait(proc);
+    await new Promise((r) => upstreamServer.close(r));
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -71,6 +71,64 @@ const upstreamBase = validHttpUrl('GITNEXUS_UPSTREAM_URL', rawUpstreamUrl);
 // resets it, so long-lived streams are unaffected. 0 disables the timeout.
 const proxyTimeoutMs = Number(process.env.GITNEXUS_PROXY_TIMEOUT_MS || '120000');
 
+// Bounded connection-retry for proxied requests. A single-instance upstream
+// (e.g. the Render private server with a disk, which can't do zero-downtime
+// deploys) has a few-second window during every restart/redeploy where the old
+// instance is gone and the new one hasn't bound its port or propagated its
+// internal DNS name yet. A connect-level failure in that window (ECONNRESET
+// "socket hang up", ENOTFOUND, ECONNREFUSED, EAI_AGAIN, ETIMEDOUT) means the
+// upstream received nothing, so re-attempting is safe (no double-executed job).
+// We retry only BEFORE any response byte reaches the browser, only for a small
+// buffered/replayable body, and keep it bounded so a genuinely-down upstream
+// still fails fast. Set attempts to 1 to disable.
+const proxyRetryAttempts = Math.max(1, Number(process.env.GITNEXUS_PROXY_RETRY_ATTEMPTS || '3'));
+const proxyRetryMaxBodyBytes = Number(
+  process.env.GITNEXUS_PROXY_RETRY_MAX_BODY_BYTES || String(256 * 1024),
+);
+const retryableProxyCodes = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ETIMEDOUT',
+]);
+
+// Read a request body into a single Buffer, capping total size. Resolves null
+// if the body exceeds `cap` or the client errors mid-read (so the caller can
+// fall back to a single streamed attempt instead of buffering). Listeners are
+// detached once settled so a later pipe of the same request is unaffected.
+function readBodyCapped(req, cap) {
+  return new Promise((resolvePromise) => {
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    const cleanup = () => {
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+    };
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolvePromise(value);
+    };
+    const onData = (chunk) => {
+      total += chunk.length;
+      if (total > cap) {
+        finish(null);
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => finish(Buffer.concat(chunks));
+    const onError = () => finish(null);
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+  });
+}
+
 // Hop-by-hop headers (RFC 7230 §6.1) are connection-specific and must not be
 // forwarded by a proxy. Node's http client sets its own Connection/
 // Transfer-Encoding for the upstream hop, so passing the browser's through
@@ -88,7 +146,11 @@ const hopByHopHeaders = [
 
 // Forward an `/api/*` request to the upstream API server, streaming the
 // request and response bodies (SSE / chunked graph streams) untouched.
-function proxyToUpstream(req, res) {
+//
+// Connect-level failures are retried a bounded number of times (see
+// proxyRetryAttempts) to ride out an upstream restart window, but only when the
+// request body is replayable — see the buffering logic below.
+async function proxyToUpstream(req, res) {
   let upstream;
   try {
     upstream = new URL(req.url, upstreamBase);
@@ -111,50 +173,102 @@ function proxyToUpstream(req, res) {
   delete headers.referer;
   headers.host = upstream.host;
 
-  const upstreamReq = requestFn(
-    {
-      protocol: upstream.protocol,
-      hostname: upstream.hostname,
-      port: upstream.port || (isHttps ? 443 : 80),
-      method: req.method,
-      path: upstream.pathname + upstream.search,
-      headers,
-    },
-    (upstreamRes) => {
-      // Forward status + headers verbatim; pipe the body so streaming
-      // responses (text/event-stream heartbeat, chunked graph stream) reach
-      // the browser incrementally instead of being buffered.
-      res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-      upstreamRes.on('error', () => res.destroy());
-      upstreamRes.pipe(res);
-    },
-  );
-  let timedOut = false;
-  upstreamReq.on('error', (err) => {
-    if (timedOut) return; // 504 already sent by the timeout handler below
-    console.error('[gitnexus-web] upstream proxy error:', err.message);
-    if (res.headersSent) {
-      res.destroy();
-    } else {
-      res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Bad gateway');
+  // Decide whether this request can be retried. A retry replays the body, so we
+  // buffer it up front — but only when it is small and its length is known:
+  //   - GET/HEAD have no body → trivially replayable (empty buffer).
+  //   - A body with a known Content-Length <= cap → buffer and retry.
+  //   - Larger / unknown-length bodies (e.g. multipart uploads) → stream once
+  //     with no retry, exactly as before (never buffer an upload).
+  const method = (req.method || 'GET').toUpperCase();
+  const hasBody = method !== 'GET' && method !== 'HEAD';
+  const len = Number(req.headers['content-length']);
+  const small = Number.isFinite(len) && len >= 0 && len <= proxyRetryMaxBodyBytes;
+  let bodyBuf = hasBody ? null : Buffer.alloc(0);
+  if (hasBody && small) {
+    bodyBuf = await readBodyCapped(req, proxyRetryMaxBodyBytes);
+    if (bodyBuf === null) {
+      // Overflowed the cap or the client errored mid-read.
+      if (!res.headersSent) {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Bad request');
+      }
+      return;
     }
-  });
-  if (proxyTimeoutMs > 0) {
-    upstreamReq.setTimeout(proxyTimeoutMs, () => {
-      timedOut = true;
-      console.error(`[gitnexus-web] upstream proxy timeout after ${proxyTimeoutMs}ms`);
+  }
+  // bodyBuf === null means "stream the live request once, no retry".
+  const retryEligible = bodyBuf !== null;
+
+  const attempt = (n) => {
+    let timedOut = false;
+    const upstreamReq = requestFn(
+      {
+        protocol: upstream.protocol,
+        hostname: upstream.hostname,
+        port: upstream.port || (isHttps ? 443 : 80),
+        method: req.method,
+        path: upstream.pathname + upstream.search,
+        headers,
+      },
+      (upstreamRes) => {
+        // Forward status + headers verbatim; pipe the body so streaming
+        // responses (text/event-stream heartbeat, chunked graph stream) reach
+        // the browser incrementally instead of being buffered.
+        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+        upstreamRes.on('error', () => res.destroy());
+        upstreamRes.pipe(res);
+      },
+    );
+    upstreamReq.on('error', (err) => {
+      if (timedOut) return; // 504 already sent by the timeout handler below
+      // Retry a connect-level failure that happened before any response byte
+      // reached the browser: the upstream got nothing, so this can't
+      // double-execute a job. Once headers are sent the body is partially
+      // written and can't be replayed — fall through and destroy.
+      if (
+        retryEligible &&
+        !res.headersSent &&
+        n < proxyRetryAttempts &&
+        retryableProxyCodes.has(err.code)
+      ) {
+        const delay = 250 * 2 ** (n - 1); // 250ms, 500ms, ...
+        console.warn(
+          `[gitnexus-web] upstream ${err.code}; retry ${n}/${proxyRetryAttempts - 1} in ${delay}ms`,
+        );
+        setTimeout(() => attempt(n + 1), delay);
+        return;
+      }
+      console.error('[gitnexus-web] upstream proxy error:', err.message);
       if (res.headersSent) {
         res.destroy();
       } else {
-        res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('Gateway timeout');
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Bad gateway');
       }
-      upstreamReq.destroy();
     });
-  }
-  req.on('error', () => upstreamReq.destroy());
-  req.pipe(upstreamReq);
+    if (proxyTimeoutMs > 0) {
+      upstreamReq.setTimeout(proxyTimeoutMs, () => {
+        timedOut = true;
+        console.error(`[gitnexus-web] upstream proxy timeout after ${proxyTimeoutMs}ms`);
+        if (res.headersSent) {
+          res.destroy();
+        } else {
+          res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Gateway timeout');
+        }
+        upstreamReq.destroy();
+      });
+    }
+    if (bodyBuf !== null) {
+      // Replayable body already buffered; write it fresh on each attempt.
+      if (bodyBuf.length) upstreamReq.write(bodyBuf);
+      upstreamReq.end();
+    } else {
+      // Non-retryable: stream the live request once.
+      req.on('error', () => upstreamReq.destroy());
+      req.pipe(upstreamReq);
+    }
+  };
+  attempt(1);
 }
 
 const contentTypes = {
