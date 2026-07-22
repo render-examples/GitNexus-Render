@@ -108,6 +108,8 @@ Demo mode is **off by default**. For public, shareable deployments, enable it by
 
 > **⚠️ Set `DEMO` on `gitnexus-server`, not `gitnexus-web`.** Only the API server process reads `DEMO`; setting it on the `gitnexus-web` service has **no effect** and demo mode stays off. After setting it, restart/redeploy `gitnexus-server` (the `sync: false` var only applies on restart) and confirm the startup log reads `Demo mode enabled (DEMO)`. If it reads `Demo mode disabled (DEMO not truthy)`, the value didn't take — check that it's on the server service and is a truthy value (`true`, `1`, or `yes`).
 
+Seed repos are the registry snapshot taken at server **boot**, so the usual way to curate them is to index repos with `DEMO` unset and restart. To remove a leaked or stale repo from a *live* demo without that restart, set the optional `DEMO_ADMIN_TOKEN` (also `sync: false`, `gitnexus-server` only) to a long random value and call `DELETE /api/demo/repo?repo=<name>` with the token in the `X-GitNexus-Admin` header. The route is only mounted when the token is set, so it stays absent by default. Generate the token with a cryptographically secure source, e.g. `openssl rand -hex 32`.
+
 ## Security notes
 
 - The API server is a **private** Render service, so the repo-indexing endpoints are not reachable from the public internet — only the web service (which proxies same-origin) can reach it.

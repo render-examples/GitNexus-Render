@@ -55,7 +55,22 @@ projects:
               # ends; the pre-indexed "seed" repos stay browsable by everyone and
               # are read-only (analyze/embed/delete against them → 403). The web
               # UI learns this flag via GET /api/info.
+              #
+              # Seed repos are the registry snapshot taken at server BOOT: to
+              # add/remove seeds, curate the registry (index with DEMO unset,
+              # or use DEMO_ADMIN_TOKEN below) and restart. Any repo registered
+              # after boot without a valid browser session is hidden, never a
+              # public seed — sessionless analyze/upload requests are rejected.
               - key: DEMO
+                sync: false
+              # Optional operator cleanup token (demo only). When set, unlocks
+              # DELETE /api/demo/repo?repo=<name> — send it as the
+              # X-GitNexus-Admin header — to remove a leaked/stale seed repo
+              # WITHOUT toggling DEMO off. Unset ⇒ the route is not mounted.
+              # Required (rather than same-host origin alone) because the web
+              # proxy strips Origin, which would otherwise leave the route
+              # publicly reachable. Use a long random value.
+              - key: DEMO_ADMIN_TOKEN
                 sync: false
               # Optional Azure DevOps Server integration. Leave unset to skip.
               - key: AZURE_DEVOPS_URL

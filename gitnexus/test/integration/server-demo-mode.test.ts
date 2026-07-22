@@ -58,10 +58,11 @@ const request = (
   routePath: string,
   payload?: unknown,
   session?: string,
+  extraHeaders?: Record<string, string>,
 ): Promise<Reply> =>
   new Promise((resolve, reject) => {
     const data = payload === undefined ? undefined : JSON.stringify(payload);
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { ...extraHeaders };
     if (data) {
       headers['content-type'] = 'application/json';
       headers['content-length'] = String(Buffer.byteLength(data));
@@ -160,7 +161,11 @@ describeDemo('gitnexus serve — demo mode (DEMO)', () => {
   let proc: ChildProcessWithoutNullStreams | undefined;
   let homeDir: string | undefined;
 
-  const startServer = async (demo: boolean, seedRepoDir?: string): Promise<number> => {
+  const startServer = async (
+    demo: boolean,
+    seedRepoDir?: string,
+    extraEnv?: Record<string, string>,
+  ): Promise<number> => {
     if (!fs.existsSync(DIST_CLI)) {
       throw new Error(`Missing ${DIST_CLI} — run npm run build before integration tests`);
     }
@@ -168,7 +173,12 @@ describeDemo('gitnexus serve — demo mode (DEMO)', () => {
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-demo-home-'));
     if (seedRepoDir) await seedRepo(homeDir, seedRepoDir);
 
-    const env: NodeJS.ProcessEnv = { ...process.env, GITNEXUS_HOME: homeDir, NODE_OPTIONS: '' };
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GITNEXUS_HOME: homeDir,
+      NODE_OPTIONS: '',
+      ...extraEnv,
+    };
     if (demo) env.DEMO = 'true';
     else delete env.DEMO;
 
@@ -281,6 +291,81 @@ describeDemo('gitnexus serve — demo mode (DEMO)', () => {
       const endBody = await postForm(port, '/api/demo/end-session', { session: 'sess-beta' });
       expect(endBody.status).toBe(200);
       expect(JSON.parse(endBody.body).ok).toBe(true);
+    } finally {
+      fs.rmSync(seedDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('with DEMO=true: analyze without a session id fails closed (never mints a public repo)', async () => {
+    const seedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-demo-seed-'));
+    try {
+      const port = await startServer(true, seedDir);
+
+      // No X-GitNexus-Session header — a non-browser caller (curl/CLI). Before
+      // the fix this silently registered an unowned = public seed repo. Now it
+      // is rejected 400 and the registry is never touched.
+      const analyze = await request(port, 'POST', '/api/analyze', {
+        url: 'https://github.com/octocat/Hello-World',
+      });
+      expect(analyze.status, 'sessionless analyze rejected').toBe(400);
+      expect(JSON.parse(analyze.body).error).toContain('session');
+
+      // An incognito (session-less) listing sees only the curated seed — no
+      // leaked repo appeared from the rejected analyze.
+      const repos = await request(port, 'GET', '/api/repos');
+      const list = JSON.parse(repos.body) as Array<{ name: string }>;
+      expect(list.map((r) => r.name).sort()).toEqual([SEED_REPO_NAME]);
+
+      // With a valid session, an empty analyze is only an input error (400),
+      // confirming the gate does not over-block real browser callers.
+      const withSession = await request(port, 'POST', '/api/analyze', {}, 'sess-live');
+      expect(withSession.status).toBe(400);
+      expect(JSON.parse(withSession.body).error).not.toContain('session id');
+    } finally {
+      fs.rmSync(seedDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('with DEMO_ADMIN_TOKEN: operator maintenance route removes a seed repo (token-gated)', async () => {
+    const seedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-demo-seed-'));
+    try {
+      const port = await startServer(true, seedDir, { DEMO_ADMIN_TOKEN: 'super-secret' });
+
+      // Without the admin token the privileged route rejects (bypass is gated).
+      const noToken = await request(port, 'DELETE', `/api/demo/repo?repo=${SEED_REPO_NAME}`);
+      expect(noToken.status).toBe(403);
+
+      // Seed is still present.
+      let list = JSON.parse((await request(port, 'GET', '/api/repos')).body) as Array<{
+        name: string;
+      }>;
+      expect(list.map((r) => r.name)).toContain(SEED_REPO_NAME);
+
+      // With the token, the operator can delete the seed without disabling demo.
+      const del = await request(
+        port,
+        'DELETE',
+        `/api/demo/repo?repo=${SEED_REPO_NAME}`,
+        undefined,
+        undefined,
+        { 'x-gitnexus-admin': 'super-secret' },
+      );
+      expect(del.status, 'admin delete').toBe(200);
+      expect(JSON.parse(del.body).deleted).toBe(SEED_REPO_NAME);
+
+      list = JSON.parse((await request(port, 'GET', '/api/repos')).body) as Array<{ name: string }>;
+      expect(list.map((r) => r.name)).not.toContain(SEED_REPO_NAME);
+    } finally {
+      fs.rmSync(seedDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('with DEMO=true but no DEMO_ADMIN_TOKEN: maintenance route is not mounted', async () => {
+    const seedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-demo-seed-'));
+    try {
+      const port = await startServer(true, seedDir);
+      const del = await request(port, 'DELETE', `/api/demo/repo?repo=${SEED_REPO_NAME}`);
+      expect(del.status, 'route absent without admin token').toBe(404);
     } finally {
       fs.rmSync(seedDir, { recursive: true, force: true });
     }

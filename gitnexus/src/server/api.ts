@@ -13,6 +13,7 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
 import { createRequire } from 'node:module';
+import { timingSafeEqual } from 'node:crypto';
 import {
   canonicalizePath,
   cloneDirBelongsToEntry,
@@ -863,6 +864,18 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // demo-store.ts. Read routes are untouched.
   const demo = parseTruthyEnv(process.env.DEMO);
   const demoStore = demo ? new DemoStore() : null;
+  // Optional operator cleanup token. When set (demo only), it unlocks a
+  // localhost-origin maintenance route that can delete or de-seed ANY repo
+  // (bypassing per-session ownership) so a leaked/stale seed can be removed
+  // WITHOUT toggling DEMO off. Required because the hosted demo's reverse proxy
+  // strips the Origin header, so `requireLocalhostOrigin` alone would leave such
+  // a privileged route publicly reachable. Unset ⇒ the route is not mounted.
+  const demoAdminToken =
+    demo &&
+    typeof process.env.DEMO_ADMIN_TOKEN === 'string' &&
+    process.env.DEMO_ADMIN_TOKEN.length > 0
+      ? process.env.DEMO_ADMIN_TOKEN
+      : undefined;
   // Always log the demo-mode state on startup so operators can confirm from the
   // logs whether DEMO took effect (a dashboard-set, sync:false var only applies
   // after a restart/redeploy). `demoRaw` echoes the raw env value (never a
@@ -898,6 +911,28 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       next();
     });
   }
+
+  // Demo-mode write gate: fail CLOSED when a mutation arrives without a valid
+  // session id. A real browser always sends `X-GitNexus-Session`; a missing one
+  // means a non-browser client (curl/CLI/MCP) or a header-stripping race —
+  // neither should be allowed to register a repo, because a repo added without a
+  // session claim would be unowned and (pre-fix) leak as a public seed. Outside
+  // demo mode this is a no-op passthrough. Used on analyze + upload routes.
+  const requireDemoSession = (
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ): void => {
+    if (demoStore && !getSessionId(req)) {
+      res.status(400).json({
+        error:
+          'GitNexus demo mode: a browser session id (X-GitNexus-Session header) is required to ' +
+          'analyze a repository. This endpoint is not available to non-browser clients in the demo.',
+      });
+      return;
+    }
+    next();
+  };
 
   // A wildcard bind (`0.0.0.0`/`::`) has no single host identity for the
   // same-host check, so browser write routes accept only loopback origins.
@@ -1082,14 +1117,28 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   if (demoStore) {
     void (async () => {
       try {
+        // 1) Reclaim repos orphaned by a previous run (crash/restart recovery).
         const orphanPaths = await demoStore.loadOrphans();
-        if (orphanPaths.length === 0) return;
-        const repos = await listRegisteredRepos();
-        for (const orphanPath of orphanPaths) {
-          const entry = findEntryByPath(repos, orphanPath);
-          if (entry) await eraseRepo(entry).catch(() => {});
+        if (orphanPaths.length > 0) {
+          const repos = await listRegisteredRepos();
+          for (const orphanPath of orphanPaths) {
+            const entry = findEntryByPath(repos, orphanPath);
+            if (entry) await eraseRepo(entry).catch(() => {});
+          }
+          logger.info({ count: orphanPaths.length }, '[demo] erased orphaned repos at boot');
         }
-        logger.info({ count: orphanPaths.length }, '[demo] erased orphaned repos at boot');
+        // 2) Snapshot whatever remains in the registry as the explicit seed
+        //    catalog. "Seed" is now an explicit marker, not "has no owner": any
+        //    repo registered AFTER boot without a session claim (a non-browser
+        //    caller, or a deploy/restart race) is not in this snapshot and so is
+        //    hidden from everyone rather than leaking as a public seed. Operators
+        //    curate the catalog by indexing repos (demo off) and restarting.
+        const seeds = await listRegisteredRepos();
+        for (const r of seeds) demoStore.markSeed(r.path);
+        logger.info(
+          { count: demoStore.seedCount() },
+          '[demo] registered boot-time repositories as explicit seed catalog',
+        );
       } catch (err) {
         logger.warn({ err }, '[demo] boot orphan cleanup failed');
       }
@@ -1292,6 +1341,67 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.json({ ok: true });
       },
     );
+  }
+
+  // DELETE /api/demo/repo?repo=<name> — operator cleanup for a leaked or stale
+  // seed/unowned repo, WITHOUT disabling demo mode. Bypasses the per-session
+  // ownership check that DELETE /api/repo enforces, so it is gated by a
+  // constant-time comparison against DEMO_ADMIN_TOKEN (X-GitNexus-Admin header)
+  // in addition to requireLocalhostOrigin. Only mounted when that token is set, so
+  // it is absent by default and never a public foothold. Also de-seeds the path
+  // so a re-registered repo of the same name doesn't inherit seed visibility.
+  if (demoStore && demoAdminToken) {
+    const adminTokenBuf = Buffer.from(demoAdminToken);
+    const adminAuthorized = (req: express.Request): boolean => {
+      const raw = req.headers['x-gitnexus-admin'];
+      const provided = typeof raw === 'string' ? raw : '';
+      const providedBuf = Buffer.from(provided);
+      // timingSafeEqual requires equal-length buffers; length itself is not
+      // secret, so a length mismatch is an immediate (constant-work) reject.
+      return (
+        providedBuf.length === adminTokenBuf.length && timingSafeEqual(providedBuf, adminTokenBuf)
+      );
+    };
+    app.delete('/api/demo/repo', createRouteLimiter(), requireLocalhostOrigin, async (req, res) => {
+      try {
+        if (!adminAuthorized(req)) {
+          res
+            .status(403)
+            .json({ error: 'GitNexus demo maintenance: invalid or missing admin token.' });
+          return;
+        }
+        const repoName = requestedRepo(req);
+        if (!repoName) {
+          res.status(400).json({ error: 'Missing repo name' });
+          return;
+        }
+        const entry = await resolveRepo(repoName);
+        if (!entry) {
+          res.status(404).json({ error: 'Repository not found' });
+          return;
+        }
+        const lockKey = getStoragePath(entry.path);
+        const lockErr = acquireRepoLock(lockKey);
+        if (lockErr) {
+          res.status(409).json({ error: lockErr });
+          return;
+        }
+        try {
+          await eraseRepo(entry);
+          demoStore.unmarkSeed(entry.path);
+          await demoStore.release([entry.path]);
+          logger.info(
+            { repo: String(entry.name).replace(/[\r\n]/g, ' ') },
+            '[demo] operator removed repository via maintenance route',
+          );
+          res.json({ deleted: entry.name });
+        } finally {
+          releaseRepoLock(lockKey);
+        }
+      } catch (err: any) {
+        res.status(500).json({ error: err.message || 'Failed to delete repo' });
+      }
+    });
   }
 
   // Get repo info
@@ -1792,6 +1902,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     '/api/analyze',
     createRouteLimiter({ limit: 10 }),
     requireLocalhostOrigin,
+    requireDemoSession,
     async (req, res) => {
       try {
         const {
@@ -1871,6 +1982,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         const job = jobManager.createJob({ repoUrl, repoPath: repoLocalPath });
 
+        // Demo mode: claim the repo for THIS session now — before the dedup
+        // early-return below and before the worker registers it — so it is
+        // visible only to this visitor and erased with them, never surfacing as
+        // a seed repo. Claiming ahead of the dedup return is essential: when a
+        // duplicate request is folded into an existing in-flight job, this
+        // request would otherwise return without ever claiming, leaving the repo
+        // unowned. For the same session (a double-click/retry) the re-claim is
+        // idempotent. NOTE: two *different* sessions analyzing the same URL map
+        // to one shared clone dir, so this last-writer-wins re-claim hands
+        // ownership to the later request (the repo stays session-private either
+        // way — no public leak). Accepted limitation of the URL-keyed clone dir;
+        // a per-session clone dir would remove the collision (tracked separately).
+        await claimDemoRepo(demoTargetPath, getSessionId(req));
+
         // If job was already running (dedup), just return its id. The token is
         // not part of the dedup identity and is never stored on the job, so a
         // token on THIS request had no effect — the existing job already
@@ -1886,11 +2011,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           res.status(202).json(body);
           return;
         }
-
-        // Demo mode: claim the repo for this session now (before the worker
-        // registers it) so it is visible only to this visitor and erased with
-        // them, never surfacing as a seed repo mid-analysis.
-        await claimDemoRepo(demoTargetPath, getSessionId(req));
 
         // Mark as active synchronously to prevent race with concurrent requests
         jobManager.updateJob(job.id, { status: 'cloning' });
@@ -1955,6 +2075,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     '/api/analyze/upload',
     createRouteLimiter({ limit: 5 }),
     requireLocalhostOrigin,
+    requireDemoSession,
     createAnalyzeUploadHandler({
       createJob: (params) => jobManager.createJob(params),
       launch: (job, targetPath, opts) => launchAnalysisWorker(job, targetPath, opts),

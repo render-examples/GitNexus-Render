@@ -29,11 +29,12 @@ afterEach(() => {
 const repo = (name: string) => path.join(home, name);
 
 describe('DemoStore ownership', () => {
-  it('treats an unclaimed repo as a seed repo, and a claimed repo as owned', async () => {
+  it('treats an unclaimed, unseeded repo as neither seed nor owned (hidden)', async () => {
     const store = new DemoStore();
     const p = repo('alpha');
 
-    expect(store.isSeed(p)).toBe(true);
+    // Absence of an owner no longer means "seed" — an unseeded repo is hidden.
+    expect(store.isSeed(p)).toBe(false);
     expect(store.ownerOf(p)).toBeUndefined();
 
     await store.claim(p, 'sess-1');
@@ -43,6 +44,23 @@ describe('DemoStore ownership', () => {
     expect(store.ownedBy(p, 'sess-1')).toBe(true);
     expect(store.ownedBy(p, 'sess-2')).toBe(false);
     expect(store.ownedBy(p, undefined)).toBe(false);
+  });
+
+  it('treats only explicitly marked repos as seeds, independent of ownership', async () => {
+    const store = new DemoStore();
+    const seeded = repo('catalog');
+    const leaked = repo('leaked');
+
+    expect(store.seedCount()).toBe(0);
+    store.markSeed(seeded);
+    expect(store.isSeed(seeded)).toBe(true);
+    expect(store.isSeed(leaked)).toBe(false); // unseeded, unowned ⇒ hidden, not public
+    expect(store.seedCount()).toBe(1);
+
+    // De-seeding (operator cleanup) makes a former seed hidden again.
+    store.unmarkSeed(seeded);
+    expect(store.isSeed(seeded)).toBe(false);
+    expect(store.seedCount()).toBe(0);
   });
 
   it('lists repos owned by a session and drops them on release (back to seed)', async () => {
@@ -57,7 +75,7 @@ describe('DemoStore ownership', () => {
 
     await store.release([repo('a'), repo('b')]);
     expect(store.reposOwnedBy('sess-1')).toEqual([]);
-    expect(store.isSeed(repo('a'))).toBe(true); // released ⇒ seed again
+    expect(store.isSeed(repo('a'))).toBe(false); // released ⇒ hidden, NOT a public seed
     expect(store.ownedBy(repo('c'), 'sess-2')).toBe(true); // untouched
   });
 

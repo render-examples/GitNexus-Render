@@ -6,8 +6,13 @@
  * visible to the next visitor. A repository must be in the shared registry to be
  * viewable, so isolation is done here: each visitor-added repo is *owned* by the
  * browser session that created it, and the server filters the registry per
- * session. A repo with no owner is a **seed** repo — the pre-indexed demo catalog
- * that every visitor may browse but none may mutate.
+ * session. A repo is a **seed** repo — part of the pre-indexed demo catalog that
+ * every visitor may browse but none may mutate — only when it is *explicitly*
+ * marked as one (see `markSeed`). Seeds are the registry snapshot taken at boot;
+ * everything registered afterwards is either session-owned or hidden. Crucially,
+ * absence of an owner no longer means "public": an unowned, unseeded repo (e.g.
+ * one registered by a non-browser caller or across a deploy/restart race) is
+ * hidden from everyone rather than silently leaking as a public seed.
  *
  * Ownership lives in memory but is mirrored to `<globalDir>/demo-owners.json` for
  * one reason only: crash recovery. If the process dies mid-session, the next boot
@@ -38,8 +43,15 @@ const OWNERS_FILE = 'demo-owners.json';
 const key = (repoPath: string): string => canonicalizePath(path.resolve(repoPath));
 
 export class DemoStore {
-  /** repo canonical path → owning session. Absence ⇒ seed repo. */
+  /** repo canonical path → owning session. */
   private owners = new Map<string, DemoOwner>();
+  /**
+   * Canonical paths of explicit seed repos — the curated catalog every visitor
+   * may browse. Populated at boot from the registry snapshot (see api.ts). A
+   * repo that is neither an explicit seed nor owned by the requesting session is
+   * hidden, so a leaked/unclaimed repo defaults to invisible, not public.
+   */
+  private seeds = new Set<string>();
   /** sessionId → last-seen epoch ms (for idle-based session-end cleanup). */
   private sessions = new Map<string, number>();
   private readonly file: string;
@@ -87,9 +99,27 @@ export class DemoStore {
     }
   }
 
-  /** True when the repo has no owner — i.e. a seed (pre-indexed) repo. */
+  /**
+   * True only when the repo is an explicitly marked seed (curated catalog).
+   * An unowned, unseeded repo is NOT a seed — it is hidden from everyone.
+   */
   isSeed(repoPath: string): boolean {
-    return !this.owners.has(key(repoPath));
+    return this.seeds.has(key(repoPath));
+  }
+
+  /** Mark a repo as an explicit seed (curated catalog, browsable by all). */
+  markSeed(repoPath: string): void {
+    this.seeds.add(key(repoPath));
+  }
+
+  /** Drop a repo's seed status (operator cleanup of a leaked/stale seed). */
+  unmarkSeed(repoPath: string): void {
+    this.seeds.delete(key(repoPath));
+  }
+
+  /** Number of explicit seed repos currently tracked (for boot logging). */
+  seedCount(): number {
+    return this.seeds.size;
   }
 
   ownerOf(repoPath: string): string | undefined {
